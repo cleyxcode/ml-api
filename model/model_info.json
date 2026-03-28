@@ -1,0 +1,13 @@
+{
+  "algorithm": "K-Nearest Neighbor",
+  "best_k": 5,
+  "features": ["soil_moisture", "temperature", "air_humidity"],
+  "labels": ["Kering", "Lembab", "Basah"],
+  "accuracy": 0,
+  "metric": "euclidean",
+  "label_desc": {
+    "Kering": "Kelembaban tanah < 40% — perlu disiram",
+    "Lembab": "Kelembaban tanah 40-70% — kondisi optimal",
+    "Basah": "Kelembaban tanah > 70% — tidak perlu disiram"
+  }
+}
