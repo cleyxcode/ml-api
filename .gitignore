@@ -4,5 +4,6 @@ __pycache__/
 *.pyo
 *.pyd
 .env
-.env.*
+.env.local
+.env.production
 .vercel

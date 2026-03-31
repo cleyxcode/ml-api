@@ -1,5 +1,6 @@
 """
 FastAPI Backend - Sistem Penyiraman Tanaman Berbasis IoT + KNN
+Storage  : Supabase (PostgreSQL)
 Endpoint:
   POST /sensor          - terima data sensor dari ESP32, klasifikasi KNN
   GET  /status          - status terakhir sistem
@@ -14,17 +15,19 @@ Endpoint:
 
 import os
 import json
-import uuid
 import asyncio
 import joblib
 import numpy as np
 from datetime import datetime
-from collections import deque
 from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
+load_dotenv()
 
 # ── Path ──────────────────────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
@@ -32,11 +35,17 @@ MODEL_PATH  = os.path.join(BASE_DIR, "model", "knn_model.pkl")
 SCALER_PATH = os.path.join(BASE_DIR, "model", "scaler.pkl")
 META_PATH   = os.path.join(BASE_DIR, "model", "model_info.json")
 
+# ── Supabase ──────────────────────────────────────────────────────────────────
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Siram Pintar API",
     description="Sistem Penyiraman Tanaman IoT dengan Klasifikasi KNN",
-    version="1.0.0",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -46,30 +55,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── State ─────────────────────────────────────────────────────────────────────
-knn_model   = None
-scaler      = None
-model_meta  = {}
-history     = deque(maxlen=500)   # simpan 500 data terakhir di memory
+# ── State (model KNN tetap di memory — tidak perlu DB) ────────────────────────
+knn_model  = None
+scaler     = None
+model_meta = {}
 
-system_state = {
-    "pump_status"   : False,       # True = ON, False = OFF
-    "mode"          : "auto",      # "auto" | "manual" | "schedule"
-    "last_label"    : None,
-    "last_updated"  : None,
+HARI_MAP = {
+    "senin": 0, "selasa": 1, "rabu": 2, "kamis": 3,
+    "jumat": 4, "sabtu": 5, "minggu": 6,
 }
 
-# Jadwal penyiraman — disimpan di memory (list of dict)
-schedules: List[dict] = []
 
-
-# ── Load model saat startup ───────────────────────────────────────────────────
+# ── Startup: load model + jalankan schedule checker ───────────────────────────
 @app.on_event("startup")
-async def load_model():
+async def startup():
     global knn_model, scaler, model_meta
 
     if not os.path.exists(MODEL_PATH):
-        print("Model belum ada! Jalankan train_model.py terlebih dahulu.")
+        print("[WARN] Model belum ada! Jalankan train_model.py terlebih dahulu.")
         return
 
     knn_model = joblib.load(MODEL_PATH)
@@ -81,17 +84,15 @@ async def load_model():
     else:
         model_meta = {"best_k": "?", "accuracy": "?"}
 
-    print(f"Model KNN dimuat. K={model_meta.get('best_k')}, Akurasi={model_meta.get('accuracy')}%")
-
-    # Jalankan background task cek jadwal setiap menit
+    print(f"[OK] Model KNN dimuat. K={model_meta.get('best_k')}, Akurasi={model_meta.get('accuracy')}%")
     asyncio.create_task(_schedule_checker())
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 class SensorData(BaseModel):
-    soil_moisture : float = Field(..., ge=0, le=100, description="Kelembaban tanah (%)")
-    temperature   : float = Field(..., ge=0, le=60,  description="Suhu udara (°C)")
-    air_humidity  : float = Field(..., ge=0, le=100, description="Kelembaban udara (%)")
+    soil_moisture : float = Field(..., ge=0, le=100)
+    temperature   : float = Field(..., ge=0, le=60)
+    air_humidity  : float = Field(..., ge=0, le=100)
 
 
 class ControlCommand(BaseModel):
@@ -100,14 +101,11 @@ class ControlCommand(BaseModel):
 
 
 class ScheduleCreate(BaseModel):
-    name             : str   = Field(..., description="Nama jadwal, mis: Pagi, Sore")
-    time             : str   = Field(..., description="Waktu HH:MM, mis: 06:00")
-    duration_minutes : int   = Field(default=5, ge=1, le=60, description="Durasi siram (menit)")
-    days             : List[str] = Field(
-        default=["senin","selasa","rabu","kamis","jumat","sabtu","minggu"],
-        description="Hari aktif: senin, selasa, ..., minggu  atau 'setiap hari'"
-    )
-    enabled          : bool  = Field(default=True)
+    name             : str        = Field(...)
+    time             : str        = Field(..., description="HH:MM")
+    duration_minutes : int        = Field(default=5, ge=1, le=60)
+    days             : List[str]  = Field(default=["senin","selasa","rabu","kamis","jumat","sabtu","minggu"])
+    enabled          : bool       = Field(default=True)
 
 
 class ScheduleUpdate(BaseModel):
@@ -118,33 +116,40 @@ class ScheduleUpdate(BaseModel):
     enabled          : Optional[bool]      = None
 
 
-# ── Helper KNN ────────────────────────────────────────────────────────────────
+# ── Helper: baca system_state dari Supabase ───────────────────────────────────
+def _get_state() -> dict:
+    res = supabase.table("system_state").select("*").eq("id", 1).single().execute()
+    return res.data or {"pump_status": False, "mode": "auto", "last_label": None, "last_updated": None}
+
+
+def _update_state(**kwargs):
+    supabase.table("system_state").update(kwargs).eq("id", 1).execute()
+
+
+# ── Helper: klasifikasi KNN ───────────────────────────────────────────────────
 def classify(soil_moisture: float, temperature: float, air_humidity: float) -> dict:
     if knn_model is None:
-        raise HTTPException(status_code=503, detail="Model belum dimuat. Jalankan train_model.py.")
+        raise HTTPException(status_code=503, detail="Model belum dimuat.")
 
-    features = np.array([[soil_moisture, temperature, air_humidity]])
+    features        = np.array([[soil_moisture, temperature, air_humidity]])
     features_scaled = scaler.transform(features)
 
-    label       = knn_model.predict(features_scaled)[0]
-    proba       = knn_model.predict_proba(features_scaled)[0]
-    classes     = knn_model.classes_
-    confidence  = round(float(max(proba)) * 100, 2)
-
+    label      = knn_model.predict(features_scaled)[0]
+    proba      = knn_model.predict_proba(features_scaled)[0]
+    classes    = knn_model.classes_
+    confidence = round(float(max(proba)) * 100, 2)
     proba_dict = {cls: round(float(p) * 100, 2) for cls, p in zip(classes, proba)}
 
-    needs_watering = label == "Kering"
-
     return {
-        "label"          : label,
-        "confidence"     : confidence,
-        "probabilities"  : proba_dict,
-        "needs_watering" : needs_watering,
-        "description"    : model_meta.get("label_desc", {}).get(label, ""),
+        "label"         : label,
+        "confidence"    : confidence,
+        "probabilities" : proba_dict,
+        "needs_watering": label == "Kering",
+        "description"   : model_meta.get("label_desc", {}).get(label, ""),
     }
 
 
-# ── Endpoint: Health Check ────────────────────────────────────────────────────
+# ── GET / ─────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {
@@ -154,108 +159,129 @@ def root():
     }
 
 
-# ── Endpoint: Terima data sensor dari ESP32 ───────────────────────────────────
+# ── POST /sensor ──────────────────────────────────────────────────────────────
 @app.post("/sensor")
 def receive_sensor(data: SensorData):
-    result = classify(data.soil_moisture, data.temperature, data.air_humidity)
-
+    result    = classify(data.soil_moisture, data.temperature, data.air_humidity)
     timestamp = datetime.now().isoformat()
+    state     = _get_state()
 
-    record = {
+    # Simpan ke sensor_readings
+    supabase.table("sensor_readings").insert({
         "timestamp"    : timestamp,
         "soil_moisture": data.soil_moisture,
         "temperature"  : data.temperature,
         "air_humidity" : data.air_humidity,
-        **result,
-    }
-    history.append(record)
+        "label"        : result["label"],
+        "confidence"   : result["confidence"],
+        "needs_watering": result["needs_watering"],
+        "description"  : result["description"],
+        "probabilities": result["probabilities"],
+        "pump_status"  : state["pump_status"],
+        "mode"         : state["mode"],
+    }).execute()
 
-    # Update system state
-    system_state["last_label"]   = result["label"]
-    system_state["last_updated"] = timestamp
+    # Update system_state
+    _update_state(last_label=result["label"], last_updated=timestamp)
 
-    # Kontrol pompa otomatis (mode auto)
+    # Kontrol pompa otomatis
     pump_action = None
-    if system_state["mode"] == "auto":
-        if result["needs_watering"] and not system_state["pump_status"]:
-            system_state["pump_status"] = True
+    if state["mode"] == "auto":
+        if result["needs_watering"] and not state["pump_status"]:
+            _update_state(pump_status=True)
             pump_action = "on"
-        elif not result["needs_watering"] and system_state["pump_status"]:
-            system_state["pump_status"] = False
+        elif not result["needs_watering"] and state["pump_status"]:
+            _update_state(pump_status=False)
             pump_action = "off"
 
+    # Baca state terbaru untuk response
+    new_state = _get_state()
+
     return {
-        "received"   : True,
-        "timestamp"  : timestamp,
-        "sensor"     : {
-            "soil_moisture": data.soil_moisture,
-            "temperature"  : data.temperature,
-            "air_humidity" : data.air_humidity,
-        },
+        "received"      : True,
+        "timestamp"     : timestamp,
+        "sensor"        : data.model_dump(),
         "classification": result,
-        "pump_status"   : system_state["pump_status"],
+        "pump_status"   : new_state["pump_status"],
         "pump_action"   : pump_action,
-        "mode"          : system_state["mode"],
+        "mode"          : new_state["mode"],
     }
 
 
-# ── Endpoint: Status sistem terkini ───────────────────────────────────────────
+# ── GET /status ───────────────────────────────────────────────────────────────
 @app.get("/status")
 def get_status():
-    latest = history[-1] if history else None
+    state = _get_state()
+
+    # Ambil data sensor terbaru
+    res = (
+        supabase.table("sensor_readings")
+        .select("*")
+        .order("timestamp", desc=True)
+        .limit(1)
+        .execute()
+    )
+    latest = res.data[0] if res.data else None
+
     return {
-        "pump_status" : system_state["pump_status"],
-        "mode"        : system_state["mode"],
-        "last_label"  : system_state["last_label"],
-        "last_updated": system_state["last_updated"],
+        "pump_status" : state["pump_status"],
+        "mode"        : state["mode"],
+        "last_label"  : state["last_label"],
+        "last_updated": state["last_updated"],
         "latest_data" : latest,
     }
 
 
-# ── Endpoint: Riwayat data ────────────────────────────────────────────────────
+# ── GET /history ──────────────────────────────────────────────────────────────
 @app.get("/history")
 def get_history(limit: int = 50):
     limit = min(limit, 500)
-    data  = list(history)[-limit:]
+
+    res = (
+        supabase.table("sensor_readings")
+        .select("*")
+        .order("timestamp", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    records = list(reversed(res.data))   # urut dari lama → baru (untuk grafik)
+
     return {
-        "total"  : len(data),
-        "records": data,
+        "total"  : len(records),
+        "records": records,
     }
 
 
-# ── Endpoint: Kontrol manual pompa ───────────────────────────────────────────
+# ── POST /control ─────────────────────────────────────────────────────────────
 @app.post("/control")
 def control_pump(cmd: ControlCommand):
     action = cmd.action.lower()
     if action not in ("on", "off"):
         raise HTTPException(status_code=400, detail="Action harus 'on' atau 'off'")
 
-    mode = cmd.mode.lower() if cmd.mode else "manual"
+    mode = (cmd.mode or "manual").lower()
     if mode not in ("auto", "manual", "schedule"):
         raise HTTPException(status_code=400, detail="Mode harus 'auto', 'manual', atau 'schedule'")
 
-    system_state["pump_status"] = (action == "on")
-    system_state["mode"]        = mode
+    _update_state(pump_status=(action == "on"), mode=mode)
+    state = _get_state()
 
     return {
         "success"    : True,
-        "pump_status": system_state["pump_status"],
-        "mode"       : system_state["mode"],
+        "pump_status": state["pump_status"],
+        "mode"       : state["mode"],
         "timestamp"  : datetime.now().isoformat(),
     }
 
 
-# ── Endpoint: Klasifikasi manual (tanpa sensor) ───────────────────────────────
+# ── POST /predict ─────────────────────────────────────────────────────────────
 @app.post("/predict")
 def predict(data: SensorData):
     result = classify(data.soil_moisture, data.temperature, data.air_humidity)
-    return {
-        "input" : data.dict(),
-        "result": result,
-    }
+    return {"input": data.model_dump(), "result": result}
 
 
-# ── Endpoint: Info model ──────────────────────────────────────────────────────
+# ── GET /model-info ───────────────────────────────────────────────────────────
 @app.get("/model-info")
 def model_info():
     if not model_meta:
@@ -263,100 +289,109 @@ def model_info():
     return model_meta
 
 
-# ── Jadwal penyiraman ─────────────────────────────────────────────────────────
-HARI_MAP = {
-    "senin": 0, "selasa": 1, "rabu": 2, "kamis": 3,
-    "jumat": 4, "sabtu": 5, "minggu": 6,
-}
-
-
+# ── GET /schedules ────────────────────────────────────────────────────────────
 @app.get("/schedules")
 def get_schedules():
-    return {"schedules": schedules}
+    res = supabase.table("schedules").select("*").order("created_at").execute()
+    return {"schedules": res.data}
 
 
+# ── POST /schedules ───────────────────────────────────────────────────────────
 @app.post("/schedules")
 def create_schedule(s: ScheduleCreate):
-    schedule = {
-        "id"              : str(uuid.uuid4()),
+    res = supabase.table("schedules").insert({
         "name"            : s.name,
         "time"            : s.time,
         "duration_minutes": s.duration_minutes,
         "days"            : s.days,
         "enabled"         : s.enabled,
-        "created_at"      : datetime.now().isoformat(),
-        "last_triggered"  : None,
-    }
-    schedules.append(schedule)
-    return {"success": True, "schedule": schedule}
+    }).execute()
+
+    return {"success": True, "schedule": res.data[0]}
 
 
+# ── PUT /schedules/{id} ───────────────────────────────────────────────────────
 @app.put("/schedules/{schedule_id}")
 def update_schedule(schedule_id: str, s: ScheduleUpdate):
-    for sc in schedules:
-        if sc["id"] == schedule_id:
-            if s.name             is not None: sc["name"]             = s.name
-            if s.time             is not None: sc["time"]             = s.time
-            if s.duration_minutes is not None: sc["duration_minutes"] = s.duration_minutes
-            if s.days             is not None: sc["days"]             = s.days
-            if s.enabled          is not None: sc["enabled"]          = s.enabled
-            return {"success": True, "schedule": sc}
-    raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
+    payload = {k: v for k, v in s.model_dump().items() if v is not None}
+    if not payload:
+        raise HTTPException(status_code=400, detail="Tidak ada field yang diupdate")
+
+    res = supabase.table("schedules").update(payload).eq("id", schedule_id).execute()
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
+
+    return {"success": True, "schedule": res.data[0]}
 
 
+# ── DELETE /schedules/{id} ────────────────────────────────────────────────────
 @app.delete("/schedules/{schedule_id}")
 def delete_schedule(schedule_id: str):
-    for i, sc in enumerate(schedules):
-        if sc["id"] == schedule_id:
-            schedules.pop(i)
-            return {"success": True}
-    raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
+    res = supabase.table("schedules").delete().eq("id", schedule_id).execute()
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
+
+    return {"success": True}
 
 
-# ── Background task: cek jadwal tiap menit ────────────────────────────────────
+# ── Background: cek jadwal tiap menit ────────────────────────────────────────
 async def _schedule_checker():
-    """Berjalan di background — cek tiap menit apakah ada jadwal yang harus dijalankan."""
     while True:
-        await asyncio.sleep(60)   # cek setiap menit
-        _run_due_schedules()
+        await asyncio.sleep(60)
+        await _run_due_schedules()
 
 
-def _run_due_schedules():
-    now    = datetime.now()
-    h_m    = now.strftime("%H:%M")
-    hari   = now.weekday()   # 0=senin … 6=minggu
+async def _run_due_schedules():
+    now   = datetime.now()
+    h_m   = now.strftime("%H:%M")
+    hari  = now.weekday()
 
-    for sc in schedules:
-        if not sc["enabled"]:
-            continue
+    res = supabase.table("schedules").select("*").eq("enabled", True).execute()
+
+    for sc in (res.data or []):
         if sc["time"] != h_m:
             continue
 
-        # Cek hari
-        days = sc.get("days", [])
-        hari_aktif = [HARI_MAP[d] for d in days if d in HARI_MAP]
+        hari_aktif = [HARI_MAP[d] for d in sc.get("days", []) if d in HARI_MAP]
         if hari not in hari_aktif:
             continue
 
-        # Jangan trigger 2x dalam 1 menit
+        # Cek sudah trigger di menit ini?
         last = sc.get("last_triggered")
         if last and last[:16] == now.isoformat()[:16]:
             continue
 
-        # Jalankan penyiraman
-        system_state["pump_status"] = True
-        system_state["mode"]        = "schedule"
-        sc["last_triggered"]        = now.isoformat()
+        # Nyalakan pompa + catat log
+        _update_state(pump_status=True, mode="schedule")
+        supabase.table("schedules").update({"last_triggered": now.isoformat()}).eq("id", sc["id"]).execute()
+        supabase.table("schedule_logs").insert({
+            "schedule_id"    : sc["id"],
+            "triggered_at"   : now.isoformat(),
+            "duration_minutes": sc["duration_minutes"],
+        }).execute()
 
         print(f"[JADWAL] '{sc['name']}' — pompa ON selama {sc['duration_minutes']} menit")
-
-        # Matikan pompa setelah durasi (non-blocking)
-        duration = sc["duration_minutes"]
-        asyncio.create_task(_stop_pump_after(duration, sc["name"]))
+        asyncio.create_task(_stop_pump_after(sc["duration_minutes"], sc["id"], sc["name"]))
 
 
-async def _stop_pump_after(minutes: int, name: str):
-    """Matikan pompa setelah durasi jadwal selesai."""
+async def _stop_pump_after(minutes: int, schedule_id: str, name: str):
     await asyncio.sleep(minutes * 60)
-    system_state["pump_status"] = False
+    _update_state(pump_status=False)
+
+    # Update completed_at di schedule_logs
+    now = datetime.now().isoformat()
+    res = (
+        supabase.table("schedule_logs")
+        .select("id")
+        .eq("schedule_id", schedule_id)
+        .is_("completed_at", "null")
+        .order("triggered_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if res.data:
+        supabase.table("schedule_logs").update({"completed_at": now}).eq("id", res.data[0]["id"]).execute()
+
     print(f"[JADWAL] '{name}' selesai — pompa OFF")
