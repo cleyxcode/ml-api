@@ -1,6 +1,6 @@
 """
 FastAPI Backend - Sistem Penyiraman Tanaman Berbasis IoT + KNN
-Storage  : Supabase (PostgreSQL)
+Storage  : MySQL (Hostinger)
 Endpoint:
   POST /sensor          - terima data sensor dari ESP32, klasifikasi KNN
   GET  /status          - status terakhir sistem
@@ -15,17 +15,20 @@ Endpoint:
 
 import os
 import json
+import uuid
 import asyncio
 import joblib
 import numpy as np
 from datetime import datetime
 from typing import Optional, List
+from contextlib import contextmanager
 
+import pymysql
+import pymysql.cursors
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from supabase import create_client, Client
 
 load_dotenv()
 
@@ -35,11 +38,12 @@ MODEL_PATH  = os.path.join(BASE_DIR, "model", "knn_model.pkl")
 SCALER_PATH = os.path.join(BASE_DIR, "model", "scaler.pkl")
 META_PATH   = os.path.join(BASE_DIR, "model", "model_info.json")
 
-# ── Supabase ──────────────────────────────────────────────────────────────────
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# ── MySQL config ──────────────────────────────────────────────────────────────
+DB_HOST = os.environ.get("DB_HOST", "srv1987.hstgr.io")
+DB_PORT = int(os.environ.get("DB_PORT", 3306))
+DB_USER = os.environ.get("DB_USER", "")
+DB_PASS = os.environ.get("DB_PASS", "")
+DB_NAME = os.environ.get("DB_NAME", "")
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -55,7 +59,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── State (model KNN tetap di memory — tidak perlu DB) ────────────────────────
+# ── KNN model (di memory) ─────────────────────────────────────────────────────
 knn_model  = None
 scaler     = None
 model_meta = {}
@@ -66,7 +70,30 @@ HARI_MAP = {
 }
 
 
-# ── Startup: load model + jalankan schedule checker ───────────────────────────
+# ── Helper: koneksi MySQL ─────────────────────────────────────────────────────
+@contextmanager
+def get_db():
+    conn = pymysql.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        connect_timeout=10,
+    )
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# ── Startup ───────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     global knn_model, scaler, model_meta
@@ -96,16 +123,16 @@ class SensorData(BaseModel):
 
 
 class ControlCommand(BaseModel):
-    action : str = Field(..., description="'on' atau 'off'")
-    mode   : Optional[str] = Field("manual", description="'manual' | 'auto' | 'schedule'")
+    action : str           = Field(..., description="'on' atau 'off'")
+    mode   : Optional[str] = Field("manual")
 
 
 class ScheduleCreate(BaseModel):
-    name             : str        = Field(...)
-    time             : str        = Field(..., description="HH:MM")
-    duration_minutes : int        = Field(default=5, ge=1, le=60)
-    days             : List[str]  = Field(default=["senin","selasa","rabu","kamis","jumat","sabtu","minggu"])
-    enabled          : bool       = Field(default=True)
+    name             : str       = Field(...)
+    time             : str       = Field(..., description="HH:MM")
+    duration_minutes : int       = Field(default=5, ge=1, le=60)
+    days             : List[str] = Field(default=["senin","selasa","rabu","kamis","jumat","sabtu","minggu"])
+    enabled          : bool      = Field(default=True)
 
 
 class ScheduleUpdate(BaseModel):
@@ -116,17 +143,28 @@ class ScheduleUpdate(BaseModel):
     enabled          : Optional[bool]      = None
 
 
-# ── Helper: baca system_state dari Supabase ───────────────────────────────────
+# ── Helper: system_state ──────────────────────────────────────────────────────
 def _get_state() -> dict:
-    res = supabase.table("system_state").select("*").eq("id", 1).single().execute()
-    return res.data or {"pump_status": False, "mode": "auto", "last_label": None, "last_updated": None}
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM system_state WHERE id = 1")
+            row = cur.fetchone()
+    if row:
+        row["pump_status"] = bool(row["pump_status"])
+    return row or {"pump_status": False, "mode": "auto", "last_label": None, "last_updated": None}
 
 
 def _update_state(**kwargs):
-    supabase.table("system_state").update(kwargs).eq("id", 1).execute()
+    if not kwargs:
+        return
+    sets = ", ".join(f"{k} = %s" for k in kwargs)
+    vals = list(kwargs.values())
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE system_state SET {sets} WHERE id = 1", vals)
 
 
-# ── Helper: klasifikasi KNN ───────────────────────────────────────────────────
+# ── Helper: KNN classify ──────────────────────────────────────────────────────
 def classify(soil_moisture: float, temperature: float, air_humidity: float) -> dict:
     if knn_model is None:
         raise HTTPException(status_code=503, detail="Model belum dimuat.")
@@ -163,28 +201,28 @@ def root():
 @app.post("/sensor")
 def receive_sensor(data: SensorData):
     result    = classify(data.soil_moisture, data.temperature, data.air_humidity)
-    timestamp = datetime.now().isoformat()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     state     = _get_state()
+    row_id    = str(uuid.uuid4())
 
-    # Simpan ke sensor_readings
-    supabase.table("sensor_readings").insert({
-        "timestamp"    : timestamp,
-        "soil_moisture": data.soil_moisture,
-        "temperature"  : data.temperature,
-        "air_humidity" : data.air_humidity,
-        "label"        : result["label"],
-        "confidence"   : result["confidence"],
-        "needs_watering": result["needs_watering"],
-        "description"  : result["description"],
-        "probabilities": result["probabilities"],
-        "pump_status"  : state["pump_status"],
-        "mode"         : state["mode"],
-    }).execute()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO sensor_readings
+                    (id, timestamp, soil_moisture, temperature, air_humidity,
+                     label, confidence, needs_watering, description, probabilities,
+                     pump_status, mode)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                row_id, timestamp,
+                data.soil_moisture, data.temperature, data.air_humidity,
+                result["label"], result["confidence"], result["needs_watering"],
+                result["description"], json.dumps(result["probabilities"]),
+                state["pump_status"], state["mode"],
+            ))
 
-    # Update system_state
     _update_state(last_label=result["label"], last_updated=timestamp)
 
-    # Kontrol pompa otomatis
     pump_action = None
     if state["mode"] == "auto":
         if result["needs_watering"] and not state["pump_status"]:
@@ -194,7 +232,6 @@ def receive_sensor(data: SensorData):
             _update_state(pump_status=False)
             pump_action = "off"
 
-    # Baca state terbaru untuk response
     new_state = _get_state()
 
     return {
@@ -213,21 +250,25 @@ def receive_sensor(data: SensorData):
 def get_status():
     state = _get_state()
 
-    # Ambil data sensor terbaru
-    res = (
-        supabase.table("sensor_readings")
-        .select("*")
-        .order("timestamp", desc=True)
-        .limit(1)
-        .execute()
-    )
-    latest = res.data[0] if res.data else None
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT * FROM sensor_readings
+                ORDER BY timestamp DESC LIMIT 1
+            """)
+            latest = cur.fetchone()
+
+    if latest and isinstance(latest.get("probabilities"), str):
+        latest["probabilities"] = json.loads(latest["probabilities"])
+    if latest:
+        latest["pump_status"]   = bool(latest["pump_status"])
+        latest["needs_watering"]= bool(latest["needs_watering"])
 
     return {
         "pump_status" : state["pump_status"],
         "mode"        : state["mode"],
         "last_label"  : state["last_label"],
-        "last_updated": state["last_updated"],
+        "last_updated": str(state["last_updated"]) if state["last_updated"] else None,
         "latest_data" : latest,
     }
 
@@ -237,19 +278,23 @@ def get_status():
 def get_history(limit: int = 50):
     limit = min(limit, 500)
 
-    res = (
-        supabase.table("sensor_readings")
-        .select("*")
-        .order("timestamp", desc=True)
-        .limit(limit)
-        .execute()
-    )
-    records = list(reversed(res.data))   # urut dari lama → baru (untuk grafik)
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT * FROM sensor_readings
+                ORDER BY timestamp DESC LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
 
-    return {
-        "total"  : len(records),
-        "records": records,
-    }
+    records = []
+    for r in reversed(rows):
+        if isinstance(r.get("probabilities"), str):
+            r["probabilities"] = json.loads(r["probabilities"])
+        r["pump_status"]    = bool(r["pump_status"])
+        r["needs_watering"] = bool(r["needs_watering"])
+        records.append(r)
+
+    return {"total": len(records), "records": records}
 
 
 # ── POST /control ─────────────────────────────────────────────────────────────
@@ -277,8 +322,7 @@ def control_pump(cmd: ControlCommand):
 # ── POST /predict ─────────────────────────────────────────────────────────────
 @app.post("/predict")
 def predict(data: SensorData):
-    result = classify(data.soil_moisture, data.temperature, data.air_humidity)
-    return {"input": data.model_dump(), "result": result}
+    return {"input": data.model_dump(), "result": classify(data.soil_moisture, data.temperature, data.air_humidity)}
 
 
 # ── GET /model-info ───────────────────────────────────────────────────────────
@@ -292,22 +336,34 @@ def model_info():
 # ── GET /schedules ────────────────────────────────────────────────────────────
 @app.get("/schedules")
 def get_schedules():
-    res = supabase.table("schedules").select("*").order("created_at").execute()
-    return {"schedules": res.data}
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM schedules ORDER BY created_at")
+            rows = cur.fetchall()
+    for r in rows:
+        if isinstance(r.get("days"), str):
+            r["days"] = json.loads(r["days"])
+        r["enabled"] = bool(r["enabled"])
+    return {"schedules": rows}
 
 
 # ── POST /schedules ───────────────────────────────────────────────────────────
 @app.post("/schedules")
 def create_schedule(s: ScheduleCreate):
-    res = supabase.table("schedules").insert({
-        "name"            : s.name,
-        "time"            : s.time,
-        "duration_minutes": s.duration_minutes,
-        "days"            : s.days,
-        "enabled"         : s.enabled,
-    }).execute()
+    new_id = str(uuid.uuid4())
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO schedules (id, name, time, duration_minutes, days, enabled)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (new_id, s.name, s.time, s.duration_minutes, json.dumps(s.days), s.enabled))
+            cur.execute("SELECT * FROM schedules WHERE id = %s", (new_id,))
+            row = cur.fetchone()
 
-    return {"success": True, "schedule": res.data[0]}
+    if isinstance(row.get("days"), str):
+        row["days"] = json.loads(row["days"])
+    row["enabled"] = bool(row["enabled"])
+    return {"success": True, "schedule": row}
 
 
 # ── PUT /schedules/{id} ───────────────────────────────────────────────────────
@@ -317,22 +373,35 @@ def update_schedule(schedule_id: str, s: ScheduleUpdate):
     if not payload:
         raise HTTPException(status_code=400, detail="Tidak ada field yang diupdate")
 
-    res = supabase.table("schedules").update(payload).eq("id", schedule_id).execute()
+    if "days" in payload:
+        payload["days"] = json.dumps(payload["days"])
 
-    if not res.data:
+    sets = ", ".join(f"{k} = %s" for k in payload)
+    vals = list(payload.values()) + [schedule_id]
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE schedules SET {sets} WHERE id = %s", vals)
+            cur.execute("SELECT * FROM schedules WHERE id = %s", (schedule_id,))
+            row = cur.fetchone()
+
+    if not row:
         raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
 
-    return {"success": True, "schedule": res.data[0]}
+    if isinstance(row.get("days"), str):
+        row["days"] = json.loads(row["days"])
+    row["enabled"] = bool(row["enabled"])
+    return {"success": True, "schedule": row}
 
 
 # ── DELETE /schedules/{id} ────────────────────────────────────────────────────
 @app.delete("/schedules/{schedule_id}")
 def delete_schedule(schedule_id: str):
-    res = supabase.table("schedules").delete().eq("id", schedule_id).execute()
-
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
-
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM schedules WHERE id = %s", (schedule_id,))
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
     return {"success": True}
 
 
@@ -340,58 +409,59 @@ def delete_schedule(schedule_id: str):
 async def _schedule_checker():
     while True:
         await asyncio.sleep(60)
-        await _run_due_schedules()
+        try:
+            await _run_due_schedules()
+        except Exception as e:
+            print(f"[JADWAL ERR] {e}")
 
 
 async def _run_due_schedules():
-    now   = datetime.now()
-    h_m   = now.strftime("%H:%M")
-    hari  = now.weekday()
+    now  = datetime.now()
+    h_m  = now.strftime("%H:%M")
+    hari = now.weekday()
 
-    res = supabase.table("schedules").select("*").eq("enabled", True).execute()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM schedules WHERE enabled = 1")
+            schedules = cur.fetchall()
 
-    for sc in (res.data or []):
+    for sc in schedules:
         if sc["time"] != h_m:
             continue
 
-        hari_aktif = [HARI_MAP[d] for d in sc.get("days", []) if d in HARI_MAP]
+        days = json.loads(sc["days"]) if isinstance(sc["days"], str) else sc["days"]
+        hari_aktif = [HARI_MAP[d] for d in days if d in HARI_MAP]
         if hari not in hari_aktif:
             continue
 
-        # Cek sudah trigger di menit ini?
         last = sc.get("last_triggered")
-        if last and last[:16] == now.isoformat()[:16]:
+        if last and str(last)[:16] == now.isoformat()[:16]:
             continue
 
-        # Nyalakan pompa + catat log
         _update_state(pump_status=True, mode="schedule")
-        supabase.table("schedules").update({"last_triggered": now.isoformat()}).eq("id", sc["id"]).execute()
-        supabase.table("schedule_logs").insert({
-            "schedule_id"    : sc["id"],
-            "triggered_at"   : now.isoformat(),
-            "duration_minutes": sc["duration_minutes"],
-        }).execute()
+
+        log_id = str(uuid.uuid4())
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE schedules SET last_triggered = %s WHERE id = %s",
+                            (now.strftime("%Y-%m-%d %H:%M:%S"), sc["id"]))
+                cur.execute("""
+                    INSERT INTO schedule_logs (id, schedule_id, triggered_at, duration_minutes)
+                    VALUES (%s, %s, %s, %s)
+                """, (log_id, sc["id"], now.strftime("%Y-%m-%d %H:%M:%S"), sc["duration_minutes"]))
 
         print(f"[JADWAL] '{sc['name']}' — pompa ON selama {sc['duration_minutes']} menit")
-        asyncio.create_task(_stop_pump_after(sc["duration_minutes"], sc["id"], sc["name"]))
+        asyncio.create_task(_stop_pump_after(sc["duration_minutes"], log_id, sc["name"]))
 
 
-async def _stop_pump_after(minutes: int, schedule_id: str, name: str):
+async def _stop_pump_after(minutes: int, log_id: str, name: str):
     await asyncio.sleep(minutes * 60)
     _update_state(pump_status=False)
 
-    # Update completed_at di schedule_logs
-    now = datetime.now().isoformat()
-    res = (
-        supabase.table("schedule_logs")
-        .select("id")
-        .eq("schedule_id", schedule_id)
-        .is_("completed_at", "null")
-        .order("triggered_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    if res.data:
-        supabase.table("schedule_logs").update({"completed_at": now}).eq("id", res.data[0]["id"]).execute()
+    completed = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE schedule_logs SET completed_at = %s WHERE id = %s",
+                        (completed, log_id))
 
     print(f"[JADWAL] '{name}' selesai — pompa OFF")
