@@ -81,7 +81,8 @@ def get_db():
         database=DB_NAME,
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
-        connect_timeout=10,
+        connect_timeout=15,
+        ssl={"ssl": {}},        # aktifkan SSL — wajib untuk Hostinger remote
     )
     try:
         yield conn
@@ -195,6 +196,19 @@ def root():
         "message"    : "Siram Pintar API berjalan",
         "model_ready": knn_model is not None,
     }
+
+
+# ── GET /db-test ── diagnosis koneksi database ────────────────────────────────
+@app.get("/db-test")
+def db_test():
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 AS ok")
+                row = cur.fetchone()
+        return {"db_status": "connected", "result": row}
+    except Exception as e:
+        return {"db_status": "error", "detail": str(e)}
 
 
 # ── POST /sensor ──────────────────────────────────────────────────────────────
@@ -456,7 +470,7 @@ async def _run_due_schedules():
 
 async def _stop_pump_after(minutes: int, log_id: str, name: str):
     await asyncio.sleep(minutes * 60)
-    _update_state(pump_status=False)
+    _update_state(pump_status=False, mode="auto")   # reset mode ke auto setelah jadwal selesai
 
     completed = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_db() as conn:
@@ -464,4 +478,4 @@ async def _stop_pump_after(minutes: int, log_id: str, name: str):
             cur.execute("UPDATE schedule_logs SET completed_at = %s WHERE id = %s",
                         (completed, log_id))
 
-    print(f"[JADWAL] '{name}' selesai — pompa OFF")
+    print(f"[JADWAL] '{name}' selesai — pompa OFF, mode kembali ke auto")
