@@ -178,7 +178,7 @@ def classify(soil_moisture: float, temperature: float, air_humidity: float) -> d
 def root():
     return {
         "status"     : "online",
-        "message"    : "Siram Pintar API berjalan",
+        "message"    : "Siram Pintar API berjalan 13",
         "model_ready": knn_model is not None,
     }
 
