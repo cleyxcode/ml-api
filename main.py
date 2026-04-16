@@ -1,18 +1,3 @@
-"""
-FastAPI Backend - Sistem Penyiraman Tanaman Berbasis IoT + KNN
-Storage  : MySQL (Hostinger)
-Endpoint:
-  POST /sensor          - terima data sensor dari ESP32, klasifikasi KNN
-  GET  /status          - status terakhir sistem
-  GET  /history         - riwayat data sensor
-  POST /control         - kontrol manual pompa (ON/OFF)
-  GET  /model-info      - informasi model KNN
-  GET  /schedules       - daftar jadwal penyiraman
-  POST /schedules       - buat jadwal baru
-  PUT  /schedules/{id}  - update jadwal
-  DELETE /schedules/{id}- hapus jadwal
-"""
-
 import os
 import json
 import uuid
