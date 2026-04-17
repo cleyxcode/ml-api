@@ -1,12 +1,11 @@
 import os
 import json
 import uuid
-import asyncio
 import logging
 import joblib
 import numpy as np
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional
 from contextlib import contextmanager
 
 import pymysql
@@ -38,19 +37,6 @@ DB_USER = os.environ.get("DB_USER", "")
 DB_PASS = os.environ.get("DB_PASS", "")
 DB_NAME = os.environ.get("DB_NAME", "")
 
-# ── Konstanta ─────────────────────────────────────────────────────────────────
-# Map hari dari angka ESP32 (Sunday=0) ke string database
-DAY_MAP = {
-    0: "minggu", 1: "senin", 2: "selasa",
-    3: "rabu", 4: "kamis", 5: "jumat", 6: "sabtu"
-}
-
-# Map hari string → angka (untuk cek jadwal)
-HARI_MAP = {
-    "senin": 1, "selasa": 2, "rabu": 3, "kamis": 4,
-    "jumat": 5, "sabtu": 6, "minggu": 0,
-}
-
 # ══════════════════════════════════════════════════════════════════════════════
 # KONFIGURASI LOGIKA PENYIRAMAN CERDAS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -69,7 +55,7 @@ CFG = WateringConfig()
 app = FastAPI(
     title="Siram Pintar API",
     description="Sistem Penyiraman Tanaman IoT dengan Klasifikasi KNN",
-    version="3.0.0",
+    version="4.0.0",
 )
 
 app.add_middleware(
@@ -85,15 +71,10 @@ scaler     = None
 model_meta: dict = {}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATABASE  — pola dari v1 (terbukti jalan), tanpa bungkus HTTPException
+# DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
 @contextmanager
 def get_db():
-    """
-    Context manager koneksi MySQL.
-    PENTING: tidak membungkus Exception menjadi HTTPException supaya
-    stack trace asli tetap terlihat dan FastAPI bisa log dengan benar.
-    """
     conn = pymysql.connect(
         host=DB_HOST,
         port=DB_PORT,
@@ -103,14 +84,14 @@ def get_db():
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
         connect_timeout=15,
-        ssl={"ssl": {}},   # wajib untuk Hostinger remote
+        ssl={"ssl": {}},
     )
     try:
         yield conn
         conn.commit()
     except Exception:
         conn.rollback()
-        raise           # lempar ulang error asli — JANGAN wrap ke HTTPException
+        raise
     finally:
         conn.close()
 
@@ -132,13 +113,14 @@ async def startup():
                 model_meta = json.load(f)
         else:
             model_meta = {"best_k": "?", "accuracy": "?"}
-        log.info("Model KNN dimuat. K=%s, Akurasi=%s%%",
-                 model_meta.get("best_k"), model_meta.get("accuracy"))
+        log.info(
+            "Model KNN dimuat. K=%s, Akurasi=%s%%",
+            model_meta.get("best_k"), model_meta.get("accuracy"),
+        )
     except Exception as exc:
         log.error("Gagal memuat model: %s", exc)
 
-    # Jadwal checker seperti v1
-    asyncio.create_task(_schedule_checker())
+    # [DIHAPUS] asyncio.create_task(_schedule_checker()) — tidak ada lagi jadwal
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -148,8 +130,6 @@ class SensorData(BaseModel):
     soil_moisture : float = Field(..., ge=0, le=100)
     temperature   : float = Field(..., ge=0, le=60)
     air_humidity  : float = Field(..., ge=0, le=100)
-    # FIX: hour/minute/day bersifat Optional dengan default fallback ke waktu server
-    # Sehingga ESP32 lama yang tidak mengirim field ini tetap bisa diterima
     hour   : Optional[int] = Field(default=None, ge=0, le=23)
     minute : Optional[int] = Field(default=None, ge=0, le=59)
     day    : Optional[int] = Field(default=None, ge=0, le=6)
@@ -159,41 +139,21 @@ class ControlCommand(BaseModel):
     action : str           = Field(..., description="'on' atau 'off'")
     mode   : Optional[str] = Field(default="manual")
 
-
-class ScheduleCreate(BaseModel):
-    name             : str       = Field(...)
-    time             : str       = Field(..., description="HH:MM")
-    duration_minutes : int       = Field(default=5, ge=1, le=60)
-    days             : List[str] = Field(
-        default=["senin","selasa","rabu","kamis","jumat","sabtu","minggu"]
-    )
-    enabled          : bool      = Field(default=True)
-
-
-class ScheduleUpdate(BaseModel):
-    name             : Optional[str]       = None
-    time             : Optional[str]       = None
-    duration_minutes : Optional[int]       = None
-    days             : Optional[List[str]] = None
-    enabled          : Optional[bool]      = None
+# [DIHAPUS] ScheduleCreate — tidak diperlukan lagi
+# [DIHAPUS] ScheduleUpdate — tidak diperlukan lagi
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HELPER: waktu
 # ══════════════════════════════════════════════════════════════════════════════
 def _resolve_time(hour: Optional[int], minute: Optional[int], day: Optional[int]):
-    """
-    Jika ESP32 mengirim hour/minute/day gunakan itu.
-    Jika tidak, fallback ke waktu server (seperti v1).
-    """
     if hour is not None and minute is not None and day is not None:
         return hour, minute, day
     now = datetime.now()
-    return now.hour, now.minute, now.weekday()  # weekday(): Mon=0 … Sun=6
+    return now.hour, now.minute, now.weekday()
 
 
 def get_elapsed_minutes(current_minutes: int, stored_minutes) -> int:
-    """Selisih menit, tangani rollover 24 jam (1440 menit)."""
     if stored_minutes is None:
         return 999999
     diff = current_minutes - int(stored_minutes)
@@ -201,7 +161,7 @@ def get_elapsed_minutes(current_minutes: int, stored_minutes) -> int:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HELPER: system_state  — pola dari v1
+# HELPER: system_state
 # ══════════════════════════════════════════════════════════════════════════════
 def _get_state() -> dict:
     with get_db() as conn:
@@ -232,7 +192,7 @@ def _update_state(**kwargs):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HELPER: KNN classify  — pola dari v1
+# HELPER: KNN classify
 # ══════════════════════════════════════════════════════════════════════════════
 def classify(soil_moisture: float, temperature: float, air_humidity: float) -> dict:
     if knn_model is None or scaler is None:
@@ -275,7 +235,6 @@ def _evaluate_smart_watering(
         "blocked_reason": None,
     }
 
-    # Pompa sedang nyala → cek apakah harus dimatikan
     if state["pump_status"]:
         elapsed_run = get_elapsed_minutes(
             current_total_minutes, state.get("pump_start_minute")
@@ -305,7 +264,6 @@ def _evaluate_smart_watering(
         response["reason"] = "Pompa tetap ON."
         return response
 
-    # Pompa mati → cek apakah perlu dinyalakan
     in_window = any(s <= hour <= e for s, e in CFG.ALLOWED_WINDOWS)
     if not in_window:
         response["blocked_reason"] = (
@@ -356,7 +314,7 @@ def root():
     return {
         "status"     : "online",
         "message"    : "Siram Pintar API berjalan",
-        "version"    : "3.0.0",
+        "version"    : "4.0.0",
         "model_ready": knn_model is not None,
     }
 
@@ -390,86 +348,18 @@ def receive_sensor(data: SensorData):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row_id    = str(uuid.uuid4())
 
-    # Resolve waktu: dari ESP32 atau dari server
     hour, minute, raw_day = _resolve_time(data.hour, data.minute, data.day)
-    current_time_str      = f"{hour:02d}:{minute:02d}"
     current_total_minutes = hour * 60 + minute
-
-    # Konversi day ESP32 (Sun=0) → nama hari
-    # Jika waktu dari server: weekday() Mon=0…Sun=6, konversi ke format DAY_MAP
-    if data.day is not None:
-        current_day_str = DAY_MAP.get(raw_day, "minggu")
-    else:
-        # weekday() dari server: 0=Mon … 6=Sun → mapping ke HARI_MAP keys
-        _server_day_names = ["senin","selasa","rabu","kamis","jumat","sabtu","minggu"]
-        current_day_str = _server_day_names[raw_day]
 
     final_action = None
 
-    # ── LOGIKA JADWAL (mode manual) ──────────────────────────────────────────
-    if state["mode"] == "manual":
-        schedule_triggered = False
+    # ── MODE MANUAL: pompa hanya merespons endpoint /control ─────────────────
+    # Tidak ada logika otomatis di sini. Pompa dikendalikan murni oleh
+    # permintaan eksplisit dari Flutter melalui POST /control.
+    # [DIHAPUS] Seluruh blok pengecekan tabel schedules (query, last_triggered, dll.)
 
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM schedules WHERE enabled = 1")
-                all_schedules = cur.fetchall()
-
-                # A. Cek jadwal yang harus MENYALA
-                for sch in all_schedules:
-                    sch_days = (
-                        json.loads(sch["days"])
-                        if isinstance(sch["days"], str)
-                        else sch["days"]
-                    )
-                    if (
-                        current_day_str in sch_days
-                        and sch["time"] == current_time_str
-                        and sch.get("last_triggered_minute") != current_total_minutes
-                    ):
-                        schedule_triggered = True
-                        cur.execute(
-                            "UPDATE schedules SET last_triggered_minute = %s, "
-                            "last_triggered = CURRENT_TIMESTAMP WHERE id = %s",
-                            (current_total_minutes, sch["id"]),
-                        )
-                        _update_state(
-                            pump_status=True,
-                            pump_start_minute=current_total_minutes,
-                        )
-                        final_action = "on"
-                        log.info("JADWAL MANUAL: '%s' pompa ON.", sch["name"])
-                        break
-
-                # B. Cek apakah jadwal harus MATI (durasi habis)
-                if (
-                    not schedule_triggered
-                    and state["pump_status"]
-                    and state.get("pump_start_minute") is not None
-                ):
-                    elapsed = get_elapsed_minutes(
-                        current_total_minutes, state["pump_start_minute"]
-                    )
-                    triggering_sch = next(
-                        (
-                            s for s in all_schedules
-                            if s.get("last_triggered_minute") == state["pump_start_minute"]
-                        ),
-                        None,
-                    )
-                    if triggering_sch:
-                        duration = triggering_sch.get("duration_minutes", 5)
-                        if elapsed >= duration:
-                            _update_state(
-                                pump_status=False,
-                                pump_start_minute=None,
-                                last_watered_minute=current_total_minutes,
-                            )
-                            final_action = "off"
-                            log.info("JADWAL SELESAI: durasi %s menit tercapai.", duration)
-
-    # ── LOGIKA CERDAS KNN (mode auto) ───────────────────────────────────────
-    elif state["mode"] == "auto":
+    # ── MODE AUTO: logika KNN ────────────────────────────────────────────────
+    if state["mode"] == "auto":
         smart_eval   = _evaluate_smart_watering(
             result, hour, minute,
             data.air_humidity, data.temperature,
@@ -499,7 +389,7 @@ def receive_sensor(data: SensorData):
                     data.soil_moisture, data.temperature, data.air_humidity,
                     result["label"], result["confidence"], result["needs_watering"],
                     result["description"],
-                    json.dumps(result["probabilities"]),   # FIX: simpan data KNN asli
+                    json.dumps(result["probabilities"]),
                     pump_status_logged, state["mode"],
                 ),
             )
@@ -510,7 +400,7 @@ def receive_sensor(data: SensorData):
     return {
         "received"      : True,
         "timestamp"     : timestamp,
-        "device_time"   : current_time_str,
+        "device_time"   : f"{hour:02d}:{minute:02d}",
         "sensor"        : {
             "soil_moisture": data.soil_moisture,
             "temperature"  : data.temperature,
@@ -583,7 +473,6 @@ def control_pump(cmd: ControlCommand):
         raise HTTPException(status_code=400, detail="Action harus 'on' atau 'off'")
 
     mode = (cmd.mode or "manual").lower()
-    # FIX: paksa 'schedule' dari Flutter menjadi 'manual' (tidak ada mode schedule di DB)
     if mode not in ("auto", "manual"):
         mode = "manual"
 
@@ -604,100 +493,6 @@ def control_pump(cmd: ControlCommand):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ENDPOINT JADWAL (CRUD)
-# ══════════════════════════════════════════════════════════════════════════════
-@app.get("/schedules")
-def get_schedules():
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM schedules ORDER BY created_at")
-            rows = cur.fetchall()
-    for r in rows:
-        if isinstance(r.get("days"), str):
-            r["days"] = json.loads(r["days"])
-        r["enabled"] = bool(r["enabled"])
-        # Normalisasi last_triggered agar bisa di-serialize JSON
-        if r.get("last_triggered") and not isinstance(r["last_triggered"], str):
-            r["last_triggered"] = str(r["last_triggered"])
-    return {"schedules": rows}
-
-
-@app.post("/schedules")
-def create_schedule(s: ScheduleCreate):
-    new_id = str(uuid.uuid4())
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO schedules (id, name, time, duration_minutes, days, enabled)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (new_id, s.name, s.time, s.duration_minutes,
-                 json.dumps(s.days), s.enabled),
-            )
-            cur.execute("SELECT * FROM schedules WHERE id = %s", (new_id,))
-            row = cur.fetchone()
-
-    if isinstance(row.get("days"), str):
-        row["days"] = json.loads(row["days"])
-    row["enabled"] = bool(row["enabled"])
-    if row.get("last_triggered") and not isinstance(row["last_triggered"], str):
-        row["last_triggered"] = str(row["last_triggered"])
-    return {"success": True, "schedule": row}
-
-
-@app.put("/schedules/{schedule_id}")
-def update_schedule(schedule_id: str, s: ScheduleUpdate):
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM schedules WHERE id = %s", (schedule_id,))
-            ext = cur.fetchone()
-            if not ext:
-                raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
-
-            # Ambil nilai lama jika field tidak diupdate
-            new_name     = s.name             if s.name             is not None else ext["name"]
-            new_time     = s.time             if s.time             is not None else ext["time"]
-            new_duration = s.duration_minutes if s.duration_minutes is not None else ext["duration_minutes"]
-            new_enabled  = s.enabled          if s.enabled          is not None else ext["enabled"]
-            new_days     = (
-                json.dumps(s.days)
-                if s.days is not None
-                else (ext["days"] if isinstance(ext["days"], str) else json.dumps(ext["days"]))
-            )
-
-            cur.execute(
-                """
-                UPDATE schedules
-                SET name=%s, time=%s, duration_minutes=%s, days=%s, enabled=%s
-                WHERE id=%s
-                """,
-                (new_name, new_time, new_duration, new_days, new_enabled, schedule_id),
-            )
-            cur.execute("SELECT * FROM schedules WHERE id = %s", (schedule_id,))
-            row = cur.fetchone()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
-    if isinstance(row.get("days"), str):
-        row["days"] = json.loads(row["days"])
-    row["enabled"] = bool(row["enabled"])
-    if row.get("last_triggered") and not isinstance(row["last_triggered"], str):
-        row["last_triggered"] = str(row["last_triggered"])
-    return {"success": True, "schedule": row}
-
-
-@app.delete("/schedules/{schedule_id}")
-def delete_schedule(schedule_id: str):
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM schedules WHERE id = %s", (schedule_id,))
-            if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
-    return {"success": True}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # ENDPOINT PREDICT (uji manual KNN)
 # ══════════════════════════════════════════════════════════════════════════════
 @app.post("/predict")
@@ -711,81 +506,7 @@ def predict(data: SensorData):
         "result": classify(data.soil_moisture, data.temperature, data.air_humidity),
     }
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# BACKGROUND TASK: cek jadwal tiap menit (dari v1)
-# ══════════════════════════════════════════════════════════════════════════════
-async def _schedule_checker():
-    while True:
-        await asyncio.sleep(60)
-        try:
-            await _run_due_schedules()
-        except Exception as e:
-            log.error("[JADWAL ERR] %s", e)
-
-
-async def _run_due_schedules():
-    now  = datetime.now()
-    h_m  = now.strftime("%H:%M")
-    # weekday(): Mon=0 … Sun=6 → map ke format HARI_MAP
-    _server_day_names = ["senin","selasa","rabu","kamis","jumat","sabtu","minggu"]
-    hari_str = _server_day_names[now.weekday()]
-
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM schedules WHERE enabled = 1")
-            schedules = cur.fetchall()
-
-    for sc in schedules:
-        if sc["time"] != h_m:
-            continue
-
-        days = json.loads(sc["days"]) if isinstance(sc["days"], str) else sc["days"]
-        if hari_str not in days:
-            continue
-
-        last = sc.get("last_triggered")
-        if last and str(last)[:16] == now.isoformat()[:16]:
-            continue
-
-        # Cek mode — hanya jalankan background scheduler jika mode auto
-        state = _get_state()
-        if state["mode"] != "auto":
-            continue
-
-        _update_state(pump_status=True, mode="auto")
-
-        log_id = str(uuid.uuid4())
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE schedules SET last_triggered = %s WHERE id = %s",
-                    (now.strftime("%Y-%m-%d %H:%M:%S"), sc["id"]),
-                )
-                cur.execute(
-                    """
-                    INSERT INTO schedule_logs
-                        (id, schedule_id, triggered_at, duration_minutes)
-                    VALUES (%s, %s, %s, %s)
-                    """,
-                    (log_id, sc["id"],
-                     now.strftime("%Y-%m-%d %H:%M:%S"), sc["duration_minutes"]),
-                )
-
-        log.info("[JADWAL] '%s' — pompa ON selama %s menit", sc["name"], sc["duration_minutes"])
-        asyncio.create_task(_stop_pump_after(sc["duration_minutes"], log_id, sc["name"]))
-
-
-async def _stop_pump_after(minutes: int, log_id: str, name: str):
-    await asyncio.sleep(minutes * 60)
-    _update_state(pump_status=False, mode="auto")
-
-    completed = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE schedule_logs SET completed_at = %s WHERE id = %s",
-                (completed, log_id),
-            )
-
-    log.info("[JADWAL] '%s' selesai — pompa OFF, mode kembali ke auto", name)
+# [DIHAPUS] _schedule_checker()  — background task jadwal
+# [DIHAPUS] _run_due_schedules() — runner jadwal per menit
+# [DIHAPUS] _stop_pump_after()   — timer mematikan pompa setelah durasi jadwal
+# [DIHAPUS] Endpoint GET/POST/PUT/DELETE /schedules
