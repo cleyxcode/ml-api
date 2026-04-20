@@ -1,6 +1,7 @@
 import os
 import json
 import uuid
+import random
 import logging
 import threading
 import joblib
@@ -68,6 +69,14 @@ async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
 # ── Global lock: mencegah race condition saat ESP32 kirim data cepat ──────────
 _sensor_lock = threading.Lock()
 _control_lock = threading.Lock()
+
+# ── Global Safety State ──────────────
+_daily_safety = {
+    "date": None,
+    "watering_count": 0,
+    "locked_out": False,
+    "last_pump_duration_sec": 0
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -385,10 +394,19 @@ def _update_rain_state(score, signals, state, current_min):
 
 
 def _should_skip_sensor(data: SensorData, state: dict) -> bool:
+    if data.soil_moisture <= 0.0 or data.temperature <= 0.0 or data.temperature >= 60.0:
+        log.warning("ANOMALI SENSOR: Nilai tidak masuk akal (Soil=%.1f%%, Temp=%.1f°C). Data diabaikan.", data.soil_moisture, data.temperature)
+        return True
+
+    last_soil = state.get("last_sensor_soil")
+    if last_soil is not None:
+        if abs(data.soil_moisture - float(last_soil)) > 30.0:
+            log.warning("ANOMALI SENSOR: Perubahan drastis >30%% (%.1f%% -> %.1f%%). Data diabaikan.", float(last_soil), data.soil_moisture)
+            return True
+
     elapsed = _elapsed_seconds_real(state.get("last_sensor_ts"))
     if elapsed > CFG.SENSOR_DEBOUNCE_SECONDS:
         return False
-    last_soil = state.get("last_sensor_soil")
     if last_soil is None:
         return False
     return abs(data.soil_moisture - float(last_soil)) <= CFG.SENSOR_TOLERANCE
@@ -399,6 +417,14 @@ def _should_skip_sensor(data: SensorData, state: dict) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
                               temperature, state, current_total_minutes):
+    global _daily_safety
+
+    current_date = datetime.now().date()
+    if _daily_safety["date"] != current_date:
+        _daily_safety["date"] = current_date
+        _daily_safety["watering_count"] = 0
+        _daily_safety["locked_out"] = False
+
     resp = {
         "action": None, "reason": "", "blocked_reason": None,
         "is_raining": False, "rain_score": 0,
@@ -406,6 +432,11 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
         "missed_session": bool(state.get("missed_session", False)),
         "decision_path": [],
     }
+
+    if _daily_safety["locked_out"]:
+        resp["blocked_reason"] = "Safety Lockout: Melebihi batas harian penyiraman maksimum (10x)."
+        resp["decision_path"].append("SAFETY_LOCKOUT")
+        return resp
 
     def _block(code, reason):
         resp["blocked_reason"] = reason
@@ -428,15 +459,42 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
     resp["is_raining"] = is_raining
     resp["rain_score"] = rain_score
 
+    # -- Dynamic Thresholds (Logika lebih pintar & adaptif) --
+    dynamic_dry_on  = CFG.SOIL_DRY_ON
+    dynamic_wet_off = CFG.SOIL_WET_OFF
+
+    if resp["hot_mode"]:
+        dynamic_dry_on  += 5.0  # Cuaca panas, mulai siram lebih awal
+        dynamic_wet_off += 5.0  # Butuh lebih banyak air
+        resp["decision_path"].append("T-HOT_ADJUST")
+    elif temperature < 25.0 and air_humidity > 80.0:
+        dynamic_dry_on  -= 5.0  # Cuaca dingin & lembab, tunda siram
+        dynamic_wet_off -= 5.0
+        resp["decision_path"].append("T-COOL_ADJUST")
+
+    if state.get("missed_session"):
+        dynamic_wet_off += 5.0  # Kompensasi sesi yang terlewat (hujan palsu)
+        resp["decision_path"].append("T-MISSED_ADJUST")
+
+    # Pastikan batas tidak melebihi 100% atau kurang dari batas minimal
+    dynamic_wet_off = min(95.0, dynamic_wet_off)
+    dynamic_dry_on  = max(CFG.CRITICAL_DRY + 5.0, dynamic_dry_on)
+
+    in_window, window_label = _in_watering_window(hour)
+    night_emergency = (not in_window and soil_moisture <= CFG.CRITICAL_DRY and not is_raining)
+    if night_emergency:
+        window_label = "malam-darurat"
+
     if state["pump_status"]:
         elapsed_sec = _elapsed_seconds_real(state.get("pump_start_ts"))
-        max_sec     = CFG.MAX_PUMP_DURATION_MINUTES * 60
+        max_sec     = 60 if night_emergency else (CFG.MAX_PUMP_DURATION_MINUTES * 60)
 
         if elapsed_sec >= max_sec:
+            _daily_safety["last_pump_duration_sec"] = elapsed_sec
             _update_state(pump_status=False, last_watered_minute=current_total_minutes,
                           last_watered_ts=datetime.now().isoformat(),
                           pump_start_ts=None, pump_start_minute=None, missed_session=False)
-            _act_off("A1", f"Auto-stop: batas {CFG.MAX_PUMP_DURATION_MINUTES} menit ({elapsed_sec:.0f}s).")
+            _act_off("A1", f"Auto-stop: batas maksimal ({elapsed_sec:.0f}s).")
             return resp
 
         if elapsed_sec < CFG.MIN_PUMP_DURATION_SECONDS:
@@ -444,14 +502,16 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
             resp["decision_path"].append("A-warmup")
             return resp
 
-        if soil_moisture >= CFG.SOIL_WET_OFF:
+        if soil_moisture >= dynamic_wet_off:
+            _daily_safety["last_pump_duration_sec"] = elapsed_sec
             _update_state(pump_status=False, last_watered_minute=current_total_minutes,
                           last_watered_ts=datetime.now().isoformat(),
                           pump_start_ts=None, pump_start_minute=None, missed_session=False)
-            _act_off("A2", f"Auto-stop: tanah cukup ({soil_moisture:.1f}% >= {CFG.SOIL_WET_OFF}%).")
+            _act_off("A2", f"Auto-stop: tanah cukup ({soil_moisture:.1f}% >= {dynamic_wet_off:.1f}%).")
             return resp
 
         if is_raining:
+            _daily_safety["last_pump_duration_sec"] = elapsed_sec
             _update_state(pump_status=False, last_watered_minute=current_total_minutes,
                           last_watered_ts=datetime.now().isoformat(),
                           pump_start_ts=None, pump_start_minute=None, missed_session=False)
@@ -464,13 +524,16 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
 
     has_missed = bool(state.get("missed_session", False))
 
-    if soil_moisture <= CFG.CRITICAL_DRY and not is_raining:
+    if night_emergency or (soil_moisture <= CFG.CRITICAL_DRY and not is_raining):
         now_ts = datetime.now().isoformat()
+        _daily_safety["watering_count"] += 1
+        if _daily_safety["watering_count"] >= 10:
+            _daily_safety["locked_out"] = True
+            
         _update_state(pump_status=True, pump_start_minute=current_total_minutes, pump_start_ts=now_ts)
-        _act_on("B1", f"SIRAM DARURAT: tanah {soil_moisture:.1f}% <= {CFG.CRITICAL_DRY}%.")
+        _act_on("B1", f"SIRAM DARURAT [{window_label}]: tanah {soil_moisture:.1f}% <= {CFG.CRITICAL_DRY}%.")
         return resp
 
-    in_window, window_label = _in_watering_window(hour)
     if not in_window:
         _block("B2", f"Di luar jam aman. WIT={hour:02d}:{minute:02d}.")
         return resp
@@ -479,13 +542,16 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
         _block("B3", f"{rain_reason}. Ditunda.")
         return resp
 
-    if soil_moisture >= CFG.SOIL_WET_OFF:
+    if soil_moisture >= dynamic_wet_off:
         if has_missed:
             _update_state(missed_session=False)
         _block("B4", f"Tanah sudah basah ({soil_moisture:.1f}%).")
         return resp
 
     effective_cooldown = CFG.POST_RAIN_COOLDOWN_MINUTES if has_missed else CFG.COOLDOWN_MINUTES
+    if _daily_safety.get("last_pump_duration_sec", 999) < 120 and not has_missed:
+        effective_cooldown = 15  # Cooldown adaptif
+        resp["decision_path"].append("ADAPTIVE_COOLDOWN")
     elapsed_cd = _elapsed_minutes(current_total_minutes, state.get("last_watered_minute"))
     if elapsed_cd < effective_cooldown:
         _block("B5", f"Cooldown: sisa {effective_cooldown - elapsed_cd} mnt.")
@@ -511,11 +577,15 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
         _block("B8", f"Confidence {result['confidence']}% < {threshold}% ({ctx}).")
         return resp
 
-    if soil_moisture > CFG.SOIL_DRY_ON:
-        _block("B9", f"Tanah {soil_moisture:.1f}% > {CFG.SOIL_DRY_ON}%.")
+    if soil_moisture > dynamic_dry_on:
+        _block("B9", f"Tanah {soil_moisture:.1f}% > batas on ({dynamic_dry_on:.1f}%).")
         return resp
 
     now_ts = datetime.now().isoformat()
+    _daily_safety["watering_count"] += 1
+    if _daily_safety["watering_count"] >= 10:
+        _daily_safety["locked_out"] = True
+        
     _update_state(pump_status=True, pump_start_minute=current_total_minutes, pump_start_ts=now_ts)
     _act_on("B10", (
         f"Siram [{window_label}]: KNN={result['label']} ({result['confidence']}%), "
@@ -572,7 +642,39 @@ def receive_sensor(data: SensorData):
         hour, minute, _day, time_source = _resolve_time_wit(data.hour, data.minute, data.day)
         current_total_minutes = _total_minutes(hour, minute)
 
+        if random.random() < 0.05:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    try:
+                        cur.execute("DELETE FROM sensor_readings WHERE timestamp < NOW() - INTERVAL 14 DAY")
+                    except Exception as e:
+                        log.error("Gagal auto-prune database: %s", e)
+
         skip_eval    = _should_skip_sensor(data, state)
+        
+        # Mencegah spam database / bug ESP32 ngirim data berulang kali dengan cepat
+        if skip_eval:
+            elapsed_spam = _elapsed_seconds_real(state.get("last_sensor_ts"))
+            if elapsed_spam < 2.0:
+                log.debug("Spam filter: Request terlalu cepat (%.1fs), abaikan operasi DB.", elapsed_spam)
+                return {
+                    "received"      : True,
+                    "timestamp"     : state.get("last_updated") or timestamp,
+                    "device_time"   : f"{hour:02d}:{minute:02d}",
+                    "time_source"   : time_source,
+                    "debounced"     : True,
+                    "sensor"        : {
+                        "soil_moisture": data.soil_moisture,
+                        "temperature"  : data.temperature,
+                        "air_humidity" : data.air_humidity,
+                    },
+                    "classification": result,
+                    "pump_status"   : state["pump_status"],
+                    "pump_action"   : None,
+                    "mode"          : state["mode"],
+                    "auto_info"     : None,
+                }
+
         final_action = None
         smart_eval   = {}
 
@@ -709,31 +811,35 @@ def control_pump(cmd: ControlCommand):
         pump_on = action == "on"
 
         same_state  = (state["pump_status"] == pump_on)
-        elapsed_sec = _elapsed_seconds_real(state.get("last_control_ts"))
+        same_mode   = (state["mode"] == mode)
 
-        if same_state and elapsed_sec < CFG.CONTROL_DEBOUNCE_SECONDS:
+        if same_state and same_mode:
+            # Cegah bug perintah duplikat mereset timer (pump_start_ts)
             return {
                 "success"    : True,
                 "debounced"  : True,
-                "message"    : f"Pompa sudah {action.upper()}, perintah duplikat diabaikan.",
+                "message"    : f"Status pompa dan mode tidak berubah, perintah duplikat diabaikan.",
                 "pump_status": state["pump_status"],
                 "mode"       : state["mode"],
-                "timestamp"  : datetime.now().isoformat(),
+                "timestamp"  : state.get("last_control_ts") or datetime.now().isoformat(),
             }
 
         now_ts        = datetime.now().isoformat()
-        update_kwargs = {"pump_status": pump_on, "mode": mode, "last_control_ts": now_ts}
-        if not pump_on:
-            update_kwargs["pump_start_ts"]      = None
-            update_kwargs["pump_start_minute"]  = None
-            update_kwargs["last_watered_ts"]    = now_ts
-            current_min = _total_minutes(*_resolve_time_wit(None, None, None)[:2])
-            update_kwargs["last_watered_minute"] = current_min
-        else:
-            update_kwargs["pump_start_ts"] = now_ts
-            now_utc = datetime.utcnow()
-            h_wit   = (now_utc.hour + 9) % 24
-            update_kwargs["pump_start_minute"] = _total_minutes(h_wit, now_utc.minute)
+        update_kwargs = {"mode": mode, "last_control_ts": now_ts}
+        
+        if not same_state:
+            update_kwargs["pump_status"] = pump_on
+            if not pump_on:
+                update_kwargs["pump_start_ts"]      = None
+                update_kwargs["pump_start_minute"]  = None
+                update_kwargs["last_watered_ts"]    = now_ts
+                current_min = _total_minutes(*_resolve_time_wit(None, None, None)[:2])
+                update_kwargs["last_watered_minute"] = current_min
+            else:
+                update_kwargs["pump_start_ts"] = now_ts
+                now_utc = datetime.utcnow()
+                h_wit   = (now_utc.hour + 9) % 24
+                update_kwargs["pump_start_minute"] = _total_minutes(h_wit, now_utc.minute)
 
         _update_state(**update_kwargs)
         new_state = _get_state()
