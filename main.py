@@ -41,6 +41,20 @@ DB_NAME = os.environ.get("DB_NAME", "")
 VALID_API_KEY  = os.environ.get("API_KEY", "")
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
+# ── Versi ─────────────────────────────────────────────────────────────────────
+APP_VERSION = "6.2.0"
+# Changelog v6.2.0:
+#   - [BUG FIX] Tambah field manual_override + manual_override_ts di state
+#     untuk mencegah auto-logic menyalakan pompa kembali setelah perintah
+#     manual off dikirim lewat /control (race condition bug)
+#   - [BUG FIX] Endpoint GET /pump-status baru yang ringan, dirancang untuk
+#     di-poll ESP32 setiap 5 detik agar delay kontrol turun dari ~30 detik
+#     menjadi maksimal 5 detik
+#   - [IMPROVE] _evaluate_smart_watering kini memeriksa manual_override di
+#     awal sebelum menjalankan seluruh logika watering
+#   - [IMPROVE] manual_override otomatis expired setelah 10 menit agar sistem
+#     tidak terkunci selamanya jika user lupa mereset
+
 
 async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
     if not VALID_API_KEY:
@@ -69,8 +83,7 @@ _daily_safety = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATABASE: Lazy connection per-request (cocok untuk Vercel serverless)
-# ── PERBAIKAN UTAMA: tidak ada koneksi dibuka saat module load ────────────────
+# DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
 def _create_connection():
     """Buat satu koneksi baru ke MySQL."""
@@ -93,7 +106,6 @@ def get_db():
     """
     Context manager: buka koneksi → yield → commit/rollback → tutup.
     Koneksi dibuka per-request dan langsung ditutup setelah selesai.
-    Ini mencegah penumpukan koneksi di Hostinger.
     """
     conn = None
     try:
@@ -156,14 +168,17 @@ class WateringConfig:
     SENSOR_DEBOUNCE_SECONDS  = 10
     SENSOR_TOLERANCE         = 1.0
 
+    # [v6.2.0] Durasi manual override berlaku (detik) sebelum auto-expired
+    MANUAL_OVERRIDE_EXPIRE_SECONDS = 600  # 10 menit
+
 
 CFG = WateringConfig()
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Siram Pintar API",
-    description="Sistem Penyiraman Tanaman IoT — KNN + Logika Cuaca Adaptif v6",
-    version="6.1.0",
+    description="Sistem Penyiraman Tanaman IoT — KNN + Logika Cuaca Adaptif",
+    version=APP_VERSION,
 )
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
@@ -180,6 +195,7 @@ model_meta: dict = {}
 @app.on_event("startup")
 async def startup():
     global knn_model, scaler, model_meta
+    log.info("Siram Pintar API v%s starting...", APP_VERSION)
     if VALID_API_KEY:
         log.info("API Key protection: AKTIF (key: %s***)", VALID_API_KEY[:2])
     else:
@@ -260,27 +276,30 @@ def _in_watering_window(hour: int) -> tuple:
 # STATE MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 _STATE_DEFAULTS = {
-    "pump_status"         : False,
-    "mode"                : "auto",
-    "last_label"          : None,
-    "last_updated"        : None,
-    "pump_start_ts"       : None,
-    "pump_start_minute"   : None,
-    "last_watered_minute" : None,
-    "last_watered_ts"     : None,
-    "last_soil_moisture"  : None,
-    "last_temperature"    : None,
-    "missed_session"      : False,
-    "rain_detected"       : False,
-    "rain_score"          : 0,
-    "rain_confirm_count"  : 0,
-    "rain_clear_count"    : 0,
-    "rain_started_minute" : None,
-    "last_control_ts"     : None,
-    "last_sensor_ts"      : None,
-    "last_sensor_soil"    : None,
-    "session_count_today" : 0,
-    "session_count_date"  : None,
+    "pump_status"          : False,
+    "mode"                 : "auto",
+    "last_label"           : None,
+    "last_updated"         : None,
+    "pump_start_ts"        : None,
+    "pump_start_minute"    : None,
+    "last_watered_minute"  : None,
+    "last_watered_ts"      : None,
+    "last_soil_moisture"   : None,
+    "last_temperature"     : None,
+    "missed_session"       : False,
+    "rain_detected"        : False,
+    "rain_score"           : 0,
+    "rain_confirm_count"   : 0,
+    "rain_clear_count"     : 0,
+    "rain_started_minute"  : None,
+    "last_control_ts"      : None,
+    "last_sensor_ts"       : None,
+    "last_sensor_soil"     : None,
+    "session_count_today"  : 0,
+    "session_count_date"   : None,
+    # [v6.2.0] Field baru untuk mencegah race condition auto vs manual off
+    "manual_override"      : False,
+    "manual_override_ts"   : None,
 }
 
 # Cache state dengan TTL 1 detik untuk kurangi query DB
@@ -308,7 +327,7 @@ def _get_state(use_cache=True) -> dict:
     if not row:
         row = dict(_STATE_DEFAULTS)
     else:
-        for bool_key in ("pump_status", "missed_session", "rain_detected"):
+        for bool_key in ("pump_status", "missed_session", "rain_detected", "manual_override"):
             row[bool_key] = bool(row.get(bool_key, False))
         for int_key in ("rain_score", "rain_confirm_count", "rain_clear_count", "session_count_today"):
             row[int_key] = int(row.get(int_key) or 0)
@@ -506,6 +525,25 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
         "decision_path" : [],
     }
 
+    # ── [v6.2.0] Cek manual_override di awal sebelum semua logika auto ────────
+    # Jika user baru saja kirim perintah off lewat /control, jangan nyalakan
+    # pompa lagi sampai override expired (10 menit) atau user reset manual.
+    if state.get("manual_override"):
+        override_age = _elapsed_seconds_real(state.get("manual_override_ts"))
+        if override_age < CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS:
+            remaining = int(CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS - override_age)
+            resp["blocked_reason"] = (
+                f"Manual override aktif: pompa dikunci off ({remaining}s lagi)"
+            )
+            resp["decision_path"].append("MANUAL_OVERRIDE_BLOCK")
+            log.debug("Auto-watering diblokir manual_override (sisa %ds)", remaining)
+            return resp
+        else:
+            # Override sudah expired, reset otomatis
+            log.info("Manual override expired, reset otomatis.")
+            _update_state(manual_override=False, manual_override_ts=None)
+    # ─────────────────────────────────────────────────────────────────────────
+
     rain_score, rain_signals = _compute_rain_score(
         air_humidity=air_humidity, soil_moisture=soil_moisture,
         temperature=temperature, last_soil=state.get("last_soil_moisture"),
@@ -651,8 +689,8 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
 def root():
     return {
         "status"      : "online",
-        "message"     : "Siram Pintar API berjalan (v6 serverless-optimized)",
-        "version"     : "6.1.0",
+        "message"     : "Siram Pintar API berjalan",
+        "version"     : APP_VERSION,
         "model_ready" : knn_model is not None,
         "auth"        : "required" if VALID_API_KEY else "disabled",
     }
@@ -766,13 +804,14 @@ def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
         "pump_action"   : final_action,
         "mode"          : new_state["mode"],
         "auto_info"     : {
-            "is_raining"    : smart_eval.get("is_raining", False),
-            "rain_score"    : smart_eval.get("rain_score", 0),
-            "hot_mode"      : smart_eval.get("hot_mode", False),
-            "missed_session": smart_eval.get("missed_session", False),
-            "reason"        : smart_eval.get("reason", ""),
-            "blocked_reason": smart_eval.get("blocked_reason"),
-            "decision_path" : smart_eval.get("decision_path", []),
+            "is_raining"      : smart_eval.get("is_raining", False),
+            "rain_score"      : smart_eval.get("rain_score", 0),
+            "hot_mode"        : smart_eval.get("hot_mode", False),
+            "missed_session"  : smart_eval.get("missed_session", False),
+            "reason"          : smart_eval.get("reason", ""),
+            "blocked_reason"  : smart_eval.get("blocked_reason"),
+            "decision_path"   : smart_eval.get("decision_path", []),
+            "manual_override" : new_state.get("manual_override", False),
         } if state["mode"] == "auto" else None,
     }
 
@@ -800,6 +839,7 @@ def get_status():
         "is_raining"      : state.get("rain_detected", False),
         "rain_score"      : state.get("rain_score", 0),
         "missed_session"  : state.get("missed_session", False),
+        "manual_override" : state.get("manual_override", False),
         "watering_windows": {
             "morning": f"{CFG.MORNING_WINDOW[0]:02d}:00–{CFG.MORNING_WINDOW[1]:02d}:59 WIT",
             "evening": f"{CFG.EVENING_WINDOW[0]:02d}:00–{CFG.EVENING_WINDOW[1]:02d}:59 WIT",
@@ -810,6 +850,25 @@ def get_status():
             "critical_dry": CFG.CRITICAL_DRY,
         },
         "latest_data": latest,
+    }
+
+
+# ── [v6.2.0] Endpoint ringan khusus untuk polling cepat ESP32 ────────────────
+# GET /pump-status hanya mengembalikan pump_status dan mode tanpa query
+# sensor_readings, sehingga sangat ringan dan aman dipanggil setiap 5 detik.
+@app.get("/pump-status", dependencies=[Depends(verify_api_key)])
+def get_pump_status():
+    """
+    Endpoint ringan untuk di-poll ESP32 setiap 5 detik.
+    Hanya mengembalikan pump_status, mode, dan manual_override.
+    Tidak menjalankan logika watering apapun.
+    """
+    state = _get_state(use_cache=True)
+    return {
+        "pump_status"    : state["pump_status"],
+        "mode"           : state["mode"],
+        "manual_override": state.get("manual_override", False),
+        "version"        : APP_VERSION,
     }
 
 
@@ -851,12 +910,13 @@ def control_pump(cmd: ControlCommand):
 
         if state["pump_status"] == pump_on and state["mode"] == mode:
             return {
-                "success"    : True,
-                "debounced"  : True,
-                "message"    : "Status tidak berubah",
-                "pump_status": state["pump_status"],
-                "mode"       : state["mode"],
-                "timestamp"  : state.get("last_control_ts") or datetime.now().isoformat(),
+                "success"         : True,
+                "debounced"       : True,
+                "message"         : "Status tidak berubah",
+                "pump_status"     : state["pump_status"],
+                "mode"            : state["mode"],
+                "manual_override" : state.get("manual_override", False),
+                "timestamp"       : state.get("last_control_ts") or datetime.now().isoformat(),
             }
 
         now_ts        = datetime.now().isoformat()
@@ -870,8 +930,19 @@ def control_pump(cmd: ControlCommand):
                 update_kwargs["last_watered_ts"]   = now_ts
                 current_min = _total_minutes(*_resolve_time_wit(None, None, None)[:2])
                 update_kwargs["last_watered_minute"] = current_min
+
+                # [v6.2.0] Set manual_override saat user kirim perintah off
+                # agar auto-logic tidak langsung menyalakan kembali pompa.
+                # Override ini akan expired otomatis setelah 10 menit.
+                update_kwargs["manual_override"]    = True
+                update_kwargs["manual_override_ts"] = now_ts
+                log.info("manual_override diaktifkan, auto-watering diblokir 10 mnt.")
+
             else:
-                update_kwargs["pump_start_ts"] = now_ts
+                # User menyalakan pompa secara manual: hapus override
+                update_kwargs["pump_start_ts"]   = now_ts
+                update_kwargs["manual_override"]  = False
+                update_kwargs["manual_override_ts"] = None
                 now_utc = datetime.utcnow()
                 h_wit   = (now_utc.hour + 9) % 24
                 update_kwargs["pump_start_minute"] = _total_minutes(h_wit, now_utc.minute)
@@ -880,11 +951,12 @@ def control_pump(cmd: ControlCommand):
         new_state = _get_state(use_cache=False)
 
         return {
-            "success"    : True,
-            "debounced"  : False,
-            "pump_status": new_state["pump_status"],
-            "mode"       : new_state["mode"],
-            "timestamp"  : now_ts,
+            "success"         : True,
+            "debounced"       : False,
+            "pump_status"     : new_state["pump_status"],
+            "mode"            : new_state["mode"],
+            "manual_override" : new_state.get("manual_override", False),
+            "timestamp"       : now_ts,
         }
 
 
@@ -899,6 +971,7 @@ def predict(data: SensorData):
 @app.get("/config", dependencies=[Depends(verify_api_key)])
 def get_config():
     return {
+        "version": APP_VERSION,
         "watering_windows": {
             "morning": f"{CFG.MORNING_WINDOW[0]:02d}:00–{CFG.MORNING_WINDOW[1]:02d}:59",
             "evening": f"{CFG.EVENING_WINDOW[0]:02d}:00–{CFG.EVENING_WINDOW[1]:02d}:59",
@@ -916,10 +989,11 @@ def get_config():
             "rh_light"        : CFG.RAIN_RH_LIGHT,
         },
         "pump_control": {
-            "max_duration_min"  : CFG.MAX_PUMP_DURATION_MINUTES,
-            "min_duration_sec"  : CFG.MIN_PUMP_DURATION_SECONDS,
-            "cooldown_normal"   : CFG.COOLDOWN_MINUTES,
-            "cooldown_post_rain": CFG.POST_RAIN_COOLDOWN_MINUTES,
+            "max_duration_min"       : CFG.MAX_PUMP_DURATION_MINUTES,
+            "min_duration_sec"       : CFG.MIN_PUMP_DURATION_SECONDS,
+            "cooldown_normal"        : CFG.COOLDOWN_MINUTES,
+            "cooldown_post_rain"     : CFG.POST_RAIN_COOLDOWN_MINUTES,
+            "manual_override_expire" : CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS,
         },
         "knn_confidence": {
             "normal"        : CFG.CONFIDENCE_NORMAL,
@@ -937,3 +1011,15 @@ def reset_rain():
         rain_clear_count=0, rain_started_minute=None, missed_session=False,
     )
     return {"success": True, "message": "State hujan di-reset."}
+
+
+# ── [v6.2.0] Endpoint untuk reset manual_override secara eksplisit ───────────
+@app.post("/reset-override", dependencies=[Depends(verify_api_key)])
+def reset_override():
+    """
+    Reset manual_override secara eksplisit.
+    Gunakan ini jika ingin membiarkan auto-watering aktif kembali
+    sebelum 10 menit timeout berakhir.
+    """
+    _update_state(manual_override=False, manual_override_ts=None)
+    return {"success": True, "message": "Manual override di-reset. Auto-watering aktif kembali."}
