@@ -163,7 +163,7 @@ CFG = WateringConfig()
 app = FastAPI(
     title="Siram Pintar API",
     description="Sistem Penyiraman Tanaman IoT — KNN + Logika Cuaca Adaptif v6",
-    version="6.0.0",
+    version="6.1.0",
 )
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
