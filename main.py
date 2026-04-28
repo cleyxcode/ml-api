@@ -34,7 +34,7 @@ META_PATH   = os.path.join(BASE_DIR, "model", "model_info.json")
 # Opsi 1: path ke file JSON service account
 FIREBASE_CRED_PATH = os.environ.get(
     "FIREBASE_CRED_PATH",
-    os.path.join(BASE_DIR, "iot-project-8494e-firebase-adminsdk-fbsvc-8b69a0c2fd.json")
+    os.path.join(BASE_DIR, "iot-project-8494e-firebase-adminsdk-fbsvc-146a8a434f.json")
 )
 # Opsi 2: database URL Firebase Realtime Database
 FIREBASE_DB_URL = os.environ.get(
