@@ -386,20 +386,10 @@ def _get_state(use_cache=True) -> dict:
 
 
 def _update_state(**kwargs):
-    """
-    [v6.3.1] BUG FIX CRITICAL: Tambah backtick pada nama kolom.
-    Sebelumnya kolom `mode` gagal di-update karena MODE adalah reserved
-    keyword di MySQL. Query tanpa backtick:
-        UPDATE system_state SET mode = 'manual' WHERE id = 1
-    Gagal silent — MySQL menolak tapi exception tidak di-raise dengan jelas.
-    Fix: gunakan backtick untuk semua nama kolom:
-        UPDATE system_state SET `mode` = 'manual' WHERE id = 1
-    """
     if not kwargs:
         return
     try:
         with _state_lock:
-            # ✅ FIX: backtick pada nama kolom agar aman dari reserved keywords MySQL
             sets   = ", ".join(f"`{k}` = %s" for k in kwargs)
             values = list(kwargs.values())
             with get_db() as conn:
@@ -407,10 +397,13 @@ def _update_state(**kwargs):
                     cur.execute(
                         f"UPDATE system_state SET {sets} WHERE id = 1", values
                     )
+                    affected = cur.rowcount  # ← tambah ini
+                    log.info("_update_state affected=%d | keys=%s", affected, list(kwargs.keys()))
         with _state_cache_lock:
             _state_cache["timestamp"] = 0
     except Exception as e:
-        log.error("Failed to update state: %s", e)
+        log.error("Failed to update state: %s | kwargs=%s", e, list(kwargs.keys()))
+        raise  # ← TAMBAH INI — paling penting!
 
 
 def _prune_sensor_readings_async():
