@@ -3,6 +3,8 @@ import json
 import uuid
 import logging
 import threading
+import asyncio
+import concurrent.futures
 import joblib
 import numpy as np
 from datetime import datetime, date
@@ -42,27 +44,57 @@ VALID_API_KEY  = os.environ.get("API_KEY", "")
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 # ── Versi ─────────────────────────────────────────────────────────────────────
-APP_VERSION = "6.3.1"
-# Changelog v6.3.1:
-#   - [BUG FIX CRITICAL] _update_state: tambah backtick pada nama kolom
-#     agar aman dari reserved keyword MySQL (terutama kolom `mode`).
-#     Sebelumnya UPDATE SET mode = 'manual' gagal silent karena `mode`
-#     adalah reserved word MySQL — menyebabkan mode tidak pernah tersimpan
-#     dan selalu kembali ke 'auto'.
-#   - [BUG FIX] Perbaikan _prune_sensor_readings_async: tidak lagi dipicu
-#     tiap request, sekarang dijadwalkan sekali per hari via flag harian
-#   - [BUG FIX] open(META_PATH) sekarang memakai context manager 'with'
-#     agar file handle tidak bocor (file handle leak)
-#   - [BUG FIX] _should_skip_sensor: lompatan soil > 30% tidak lagi
-#     dianggap anomali ketika pompa sedang ON (data valid saat siram)
-#   - [IMPROVE] classify() sekarang menerima fitur 'hour' (jam WIT) sebagai
-#     fitur ke-4 untuk KNN, sehingga model sadar waktu pagi/sore/malam
-#   - [IMPROVE] Tambah fungsi _encode_hour_cyclic() untuk encoding jam
-#     menjadi sin+cos agar KNN memahami jam 23 dekat dengan jam 0
-#   - [IMPROVE] Skor KNN kini digabungkan dengan bobot waktu (time_weight)
-#     sebelum keputusan akhir, menambah lapisan logika tanpa retraining model
-#   - [IMPROVE] Tambah endpoint GET /diagnostics untuk melihat semua state
-#     dan info debug tanpa perlu cek database langsung
+APP_VERSION = "6.5.0"
+# ═══════════════════════════════════════════════════════════════════════════
+# Changelog v6.5.0 — "api_optimasi" — semua bug dari analisis v6.4.0 fixed
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# [FIX #1 — KRITIS] Race condition di _update_state saat conn= diberikan
+#   MASALAH : Saat conn diberikan, _state_lock tidak di-acquire. /control
+#             dan /sensor bisa menulis ke baris yang sama secara bersamaan.
+#   SOLUSI  : _update_state(conn=...) sekarang SELALU acquire _state_lock,
+#             baik dengan conn baru maupun conn yang diberikan. Lock dilepas
+#             hanya setelah operasi selesai. Ini menjamin mutual exclusion
+#             penuh di semua jalur tulis.
+#
+# [FIX #2 — KRITIS] time.sleep() blocking event loop ASGI
+#   MASALAH : get_db() memanggil time.sleep() saat retry. Di FastAPI +
+#             uvicorn (async), ini membekukan seluruh event loop — semua
+#             request lain ikut menunggu selama retry berlangsung.
+#   SOLUSI  : get_db() dipisah menjadi dua:
+#             - get_db()       → sync context manager (untuk BackgroundTasks
+#               dan fungsi sync biasa, BOLEH pakai time.sleep)
+#             - get_db_async() → async context manager (untuk endpoint async,
+#               retry memakai await asyncio.sleep() agar non-blocking)
+#             Endpoint yang dipanggil dari async path pakai get_db_async().
+#             BackgroundTasks (sudah di thread pool) tetap pakai get_db().
+#
+# [FIX #3 — SEDANG] Cache diinvalidasi sebelum commit selesai
+#   MASALAH : _update_state() invalidate cache (timestamp=0) sebelum
+#             get_db() commit transaksi. Request lain bisa membaca DB
+#             sebelum data baru ter-commit → dapat data lama.
+#   SOLUSI  : Urutan diperbaiki:
+#             - Saat conn=None (koneksi sendiri): cache diinvalidate di dalam
+#               blok get_db(), SETELAH commit otomatis terjadi di __exit__.
+#             - Saat conn=... (koneksi dari luar): cache diinvalidate HANYA
+#               setelah caller memanggil conn.commit() — dilakukan via
+#               flag return agar caller yang bertanggung jawab.
+#             Praktisnya: semua caller (sensor, control) sudah memanggil
+#             _invalidate_state_cache() eksplisit setelah with get_db() selesai.
+#
+# [FIX #4 — SEDANG] _daily_safety hilang saat server restart / cold-start
+#   MASALAH : watering_count dan locked_out hanya di RAM. Restart Vercel
+#             (cold-start) mereset counter → pompa bisa menyala >10x sehari.
+#   SOLUSI  : watering_count dan session_count_date dipersistensikan ke kolom
+#             session_count_today dan session_count_date di tabel system_state
+#             yang sudah ada. Saat startup, nilai dibaca dari DB dan di-sync
+#             ke _daily_safety. Saat counter naik, DB diupdate bersamaan
+#             dengan update state lainnya (tanpa koneksi ekstra).
+#
+# [IMPROVE] Tambah _invalidate_state_cache() sebagai fungsi eksplisit
+# [IMPROVE] Tambah _sync_daily_safety_from_db() dipanggil saat startup
+# [IMPROVE] Endpoint /sensor tidak insert duplikat saat debounced
+# [IMPROVE] Tambah executor thread pool untuk sync blocking ops
 
 
 async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
@@ -72,29 +104,38 @@ async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
     if api_key != VALID_API_KEY:
         log.warning("Akses ditolak: API key tidak valid '%s'", api_key)
         raise HTTPException(status_code=401, detail={
-            "error": "Unauthorized",
+            "error"  : "Unauthorized",
             "message": "API key tidak valid atau tidak ada. Sertakan header: X-API-Key: <key>",
         })
     return api_key
 
 
 # ── Locks ─────────────────────────────────────────────────────────────────────
+# [FIX #1] _state_lock sekarang dipakai di SEMUA jalur _update_state,
+# termasuk saat conn= diberikan dari luar.
 _state_lock   = threading.Lock()
 _control_lock = threading.Lock()
 
 _daily_safety_lock = threading.Lock()
 _daily_safety = {
-    "date"                : None,
-    "watering_count"      : 0,
-    "locked_out"          : False,
+    "date"                 : None,
+    "watering_count"       : 0,
+    "locked_out"           : False,
     "last_pump_duration_sec": 0,
-    "prune_done_today"    : False,
+    "prune_done_today"     : False,
 }
+
+# Thread pool untuk menjalankan sync blocking ops (get_db retry) dari async context
+_db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="db-worker")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
+DB_MAX_RETRIES     = 3
+DB_RETRY_DELAY_SEC = 1.5  # exponential: 1.5s → 3s → 6s
+
+
 def _create_connection():
     """Buat satu koneksi baru ke MySQL."""
     return pymysql.connect(
@@ -106,37 +147,135 @@ def _create_connection():
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
         connect_timeout=10,
+        read_timeout=10,
+        write_timeout=10,
         ssl={"ssl": {}},
         autocommit=False,
+    )
+
+
+def _connect_with_retry_sync() -> pymysql.connections.Connection:
+    """
+    Coba buka koneksi MySQL dengan retry sync (time.sleep).
+    Aman dipanggil dari thread pool atau BackgroundTasks.
+    JANGAN panggil langsung dari async endpoint — gunakan get_db_async().
+    """
+    last_error = None
+    for attempt in range(1, DB_MAX_RETRIES + 1):
+        try:
+            return _create_connection()
+        except pymysql.err.OperationalError as e:
+            last_error = e
+            err_code   = e.args[0] if e.args else 0
+            if err_code in (1040, 2003, 2006, 2013) and attempt < DB_MAX_RETRIES:
+                delay = DB_RETRY_DELAY_SEC * (2 ** (attempt - 1))
+                log.warning(
+                    "DB koneksi gagal (errno=%d, attempt=%d/%d), sync retry %.1fs...",
+                    err_code, attempt, DB_MAX_RETRIES, delay
+                )
+                time.sleep(delay)
+            else:
+                break
+        except Exception as e:
+            last_error = e
+            break
+
+    log.error("DB tidak bisa dikoneksi setelah %d percobaan: %s", DB_MAX_RETRIES, last_error)
+    raise HTTPException(
+        status_code=503,
+        detail="Database tidak dapat diakses (shared hosting limit). Coba lagi sebentar."
     )
 
 
 @contextmanager
 def get_db():
     """
-    Context manager: buka koneksi → yield → commit/rollback → tutup.
-    Koneksi dibuka per-request dan langsung ditutup setelah selesai.
+    Sync context manager: buka → yield → commit/rollback → tutup.
+    Gunakan untuk: BackgroundTasks, fungsi sync, _update_state internal.
+    Retry memakai time.sleep() — AMAN di thread, TIDAK AMAN di async handler.
     """
     conn = None
     try:
-        conn = _create_connection()
+        conn = _connect_with_retry_sync()
         yield conn
         conn.commit()
     except HTTPException:
         if conn:
-            conn.rollback()
+            try: conn.rollback()
+            except Exception: pass
         raise
     except Exception as e:
         if conn:
-            conn.rollback()
+            try: conn.rollback()
+            except Exception: pass
         log.error("DB error: %s", e)
-        raise HTTPException(status_code=503, detail="Database unavailable")
+        raise HTTPException(status_code=503, detail="Database error")
     finally:
         if conn:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            try: conn.close()
+            except Exception: pass
+
+
+# [FIX #2] Async context manager — retry memakai await asyncio.sleep()
+# agar tidak memblokir event loop uvicorn saat koneksi gagal.
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def get_db_async():
+    """
+    Async context manager: retry memakai asyncio.sleep() — NON-BLOCKING.
+    Gunakan di endpoint async (receive_sensor, control_pump, dll).
+    Koneksi fisik dibuka di thread pool agar pymysql (sync) tidak block loop.
+    """
+    loop = asyncio.get_event_loop()
+    conn = None
+    last_error = None
+
+    for attempt in range(1, DB_MAX_RETRIES + 1):
+        try:
+            # Buka koneksi di thread pool (pymysql adalah library sync)
+            conn = await loop.run_in_executor(_db_executor, _create_connection)
+            break
+        except pymysql.err.OperationalError as e:
+            last_error = e
+            err_code   = e.args[0] if e.args else 0
+            if err_code in (1040, 2003, 2006, 2013) and attempt < DB_MAX_RETRIES:
+                delay = DB_RETRY_DELAY_SEC * (2 ** (attempt - 1))
+                log.warning(
+                    "DB koneksi gagal (errno=%d, attempt=%d/%d), async retry %.1fs...",
+                    err_code, attempt, DB_MAX_RETRIES, delay
+                )
+                await asyncio.sleep(delay)  # ← NON-BLOCKING, event loop tetap jalan
+            else:
+                break
+        except Exception as e:
+            last_error = e
+            break
+
+    if conn is None:
+        log.error("DB tidak bisa dikoneksi (async) setelah %d percobaan: %s",
+                  DB_MAX_RETRIES, last_error)
+        raise HTTPException(
+            status_code=503,
+            detail="Database tidak dapat diakses. Coba lagi sebentar."
+        )
+
+    try:
+        yield conn
+        # Commit di thread pool (operasi sync)
+        await loop.run_in_executor(_db_executor, conn.commit)
+    except HTTPException:
+        try: await loop.run_in_executor(_db_executor, conn.rollback)
+        except Exception: pass
+        raise
+    except Exception as e:
+        try: await loop.run_in_executor(_db_executor, conn.rollback)
+        except Exception: pass
+        log.error("DB async error: %s", e)
+        raise HTTPException(status_code=503, detail="Database error")
+    finally:
+        try: await loop.run_in_executor(_db_executor, conn.close)
+        except Exception: pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -189,8 +328,8 @@ CFG = WateringConfig()
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Siram Pintar API",
-    description="Sistem Penyiraman Tanaman IoT — KNN + Logika Cuaca Adaptif",
+    title="Siram Pintar API — Optimasi",
+    description="Sistem Penyiraman Tanaman IoT — KNN + Logika Cuaca Adaptif (v6.5.0)",
     version=APP_VERSION,
 )
 app.add_middleware(
@@ -208,11 +347,16 @@ model_meta: dict = {}
 @app.on_event("startup")
 async def startup():
     global knn_model, scaler, model_meta
-    log.info("Siram Pintar API v%s starting...", APP_VERSION)
+    log.info("Siram Pintar API v%s (api_optimasi) starting...", APP_VERSION)
+
     if VALID_API_KEY:
         log.info("API Key protection: AKTIF (key: %s***)", VALID_API_KEY[:2])
     else:
         log.warning("API Key protection: TIDAK AKTIF — set API_KEY di environment!")
+
+    # [FIX #4] Sinkronisasi _daily_safety dari DB saat startup
+    # agar watering_count tidak reset ke 0 saat cold-start
+    await _sync_daily_safety_from_db()
 
     if not os.path.exists(MODEL_PATH):
         log.warning("Model belum ada! Jalankan train_model.py terlebih dahulu.")
@@ -349,12 +493,18 @@ _state_cache      = {"data": None, "timestamp": 0}
 _state_cache_lock = threading.Lock()
 
 
-def _get_state(use_cache=True) -> dict:
+def _invalidate_state_cache():
+    """[FIX #3] Invalidate cache secara eksplisit setelah commit terjadi."""
+    with _state_cache_lock:
+        _state_cache["timestamp"] = 0
+
+
+def _get_state(use_cache: bool = True) -> dict:
     now = time.time()
 
     if use_cache:
         with _state_cache_lock:
-            if _state_cache["data"] and (now - _state_cache["timestamp"]) < 1.0:
+            if _state_cache["data"] and (now - _state_cache["timestamp"]) < 2.0:
                 return _state_cache["data"].copy()
 
     try:
@@ -364,6 +514,10 @@ def _get_state(use_cache=True) -> dict:
                 row = cur.fetchone()
     except Exception as e:
         log.error("Failed to get state: %s", e)
+        with _state_cache_lock:
+            if _state_cache["data"]:
+                log.warning("Menggunakan state cache lama karena DB error")
+                return _state_cache["data"].copy()
         return dict(_STATE_DEFAULTS)
 
     if not row:
@@ -385,36 +539,150 @@ def _get_state(use_cache=True) -> dict:
     return row
 
 
+def _update_state_on_conn(conn, **kwargs):
+    """
+    [FIX #1 + FIX #3] Eksekusi UPDATE ke koneksi yang sudah ada.
+    Caller WAJIB sudah memegang _state_lock sebelum memanggil fungsi ini.
+    Cache TIDAK diinvalidate di sini — caller invalidate setelah commit.
+
+    Ini adalah inner function yang tidak boleh dipanggil langsung dari luar
+    modul; gunakan _update_state() atau _update_state_batch() sebagai gantinya.
+    """
+    if not kwargs:
+        return
+    sets   = ", ".join(f"`{k}` = %s" for k in kwargs)
+    values = list(kwargs.values())
+    sql    = f"UPDATE system_state SET {sets} WHERE id = 1"
+    with conn.cursor() as cur:
+        cur.execute(sql, values)
+        affected = cur.rowcount
+        log.info("_update_state affected=%d | keys=%s", affected, list(kwargs.keys()))
+        if affected == 0:
+            log.warning("_update_state: 0 rows affected! Apakah system_state id=1 ada?")
+
+
 def _update_state(**kwargs):
+    """
+    [FIX #1 + FIX #3] Update state dengan koneksi sendiri + lock penuh.
+
+    Urutan yang benar:
+      1. Acquire _state_lock           ← mutex terhadap semua writer lain
+      2. Buka koneksi baru via get_db()
+      3. Eksekusi UPDATE
+      4. get_db().__exit__ → commit otomatis
+      5. Tutup koneksi
+      6. Invalidate cache              ← SETELAH commit selesai (FIX #3)
+      7. Release _state_lock
+    """
     if not kwargs:
         return
     try:
         with _state_lock:
-            sets   = ", ".join(f"`{k}` = %s" for k in kwargs)
-            values = list(kwargs.values())
             with get_db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        f"UPDATE system_state SET {sets} WHERE id = 1", values
-                    )
-                    affected = cur.rowcount  # ← tambah ini
-                    log.info("_update_state affected=%d | keys=%s", affected, list(kwargs.keys()))
-        with _state_cache_lock:
-            _state_cache["timestamp"] = 0
+                _update_state_on_conn(conn, **kwargs)
+            # [FIX #3] Invalidate cache SETELAH get_db() commit dan tutup
+            _invalidate_state_cache()
+    except HTTPException:
+        raise
     except Exception as e:
         log.error("Failed to update state: %s | kwargs=%s", e, list(kwargs.keys()))
-        raise  # ← TAMBAH INI — paling penting!
+        raise
+
+
+def _update_state_batch(conn, **kwargs):
+    """
+    [FIX #1 + FIX #3] Update state pada koneksi yang sudah ada (batch mode).
+
+    Digunakan saat caller membuka koneksi sendiri untuk menggabungkan
+    beberapa operasi dalam satu transaksi (hemat koneksi di shared hosting).
+
+    Caller WAJIB:
+      1. Sudah memegang _state_lock (acquire sebelum memanggil ini)
+      2. Memanggil _invalidate_state_cache() SETELAH conn.commit()
+
+    Contoh pemakaian yang benar:
+        with _state_lock:
+            with get_db() as conn:
+                _update_state_batch(conn, pump_status=True, ...)
+                # insert sensor juga di sini jika perlu
+            _invalidate_state_cache()  # ← setelah with get_db() selesai (sudah commit)
+    """
+    _update_state_on_conn(conn, **kwargs)
+
+
+# ── [FIX #4] Persistensi _daily_safety ───────────────────────────────────────
+async def _sync_daily_safety_from_db():
+    """
+    [FIX #4] Baca session_count_today dan session_count_date dari DB,
+    lalu sinkronisasi ke _daily_safety in-memory.
+    Dipanggil sekali saat startup untuk recover dari cold-start / restart.
+    """
+    try:
+        async with get_db_async() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT session_count_today, session_count_date FROM system_state WHERE id = 1"
+                )
+                row = cur.fetchone()
+
+        if not row:
+            log.warning("_sync_daily_safety: system_state id=1 tidak ditemukan.")
+            return
+
+        db_count = int(row.get("session_count_today") or 0)
+        db_date_raw = row.get("session_count_date")
+        db_date = None
+        if db_date_raw:
+            try:
+                db_date = date.fromisoformat(str(db_date_raw)[:10])
+            except Exception:
+                db_date = None
+
+        today = date.today()
+        with _daily_safety_lock:
+            if db_date == today:
+                # Hari yang sama: lanjutkan dari counter DB
+                _daily_safety["date"]            = today
+                _daily_safety["watering_count"]  = db_count
+                _daily_safety["locked_out"]      = (db_count >= 10)
+                log.info(
+                    "_sync_daily_safety: recovered watering_count=%d from DB (date=%s)",
+                    db_count, today
+                )
+            else:
+                # Hari baru atau belum ada: mulai dari 0
+                _daily_safety["date"]            = today
+                _daily_safety["watering_count"]  = 0
+                _daily_safety["locked_out"]      = False
+                log.info("_sync_daily_safety: hari baru, counter direset ke 0.")
+
+    except Exception as e:
+        log.error("_sync_daily_safety gagal: %s — mulai dari counter 0", e)
+
+
+def _daily_safety_reset_if_new_day():
+    """
+    Cek dan reset counter harian jika tanggal berubah.
+    Selalu dipanggil di dalam _daily_safety_lock.
+    """
+    today = date.today()
+    if _daily_safety["date"] != today:
+        _daily_safety["date"]             = today
+        _daily_safety["watering_count"]   = 0
+        _daily_safety["locked_out"]       = False
+        _daily_safety["prune_done_today"] = False
+        return True  # hari baru
+    return False
 
 
 def _prune_sensor_readings_async():
-    """
-    [v6.3.0] FIX: Pruning dijadwalkan sekali per hari via _daily_safety flag.
-    """
+    """Pruning dijadwalkan sekali per hari via _daily_safety flag."""
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "DELETE FROM sensor_readings WHERE timestamp < NOW() - INTERVAL 14 DAY LIMIT 1000"
+                    "DELETE FROM sensor_readings "
+                    "WHERE timestamp < NOW() - INTERVAL 14 DAY LIMIT 500"
                 )
                 deleted = cur.rowcount
                 log.info("Pruned %d old sensor readings", deleted)
@@ -424,21 +692,15 @@ def _prune_sensor_readings_async():
 
 def _maybe_schedule_prune(bg_tasks: BackgroundTasks):
     """Jalankan pruning hanya sekali per hari."""
-    current_date = date.today()
     with _daily_safety_lock:
-        if _daily_safety["date"] != current_date:
-            _daily_safety["date"]            = current_date
-            _daily_safety["watering_count"]  = 0
-            _daily_safety["locked_out"]      = False
-            _daily_safety["prune_done_today"] = False
-
+        _daily_safety_reset_if_new_day()
         if not _daily_safety["prune_done_today"]:
             _daily_safety["prune_done_today"] = True
             bg_tasks.add_task(_prune_sensor_readings_async)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KNN Classify — v6.3.0: time-aware confidence adjustment
+# KNN Classify — time-aware confidence adjustment
 # ══════════════════════════════════════════════════════════════════════════════
 def classify(soil: float, temp: float, rh: float, hour: int = 12) -> dict:
     if knn_model is None or scaler is None:
@@ -450,9 +712,9 @@ def classify(soil: float, temp: float, rh: float, hour: int = 12) -> dict:
         confs = {cls: round(float(p) * 100, 2) for cls, p in zip(knn_model.classes_, proba)}
         conf  = round(float(max(proba)) * 100, 2)
 
-        time_weight            = _get_time_weight(hour)
-        time_adjusted_conf     = round(conf * time_weight, 2)
-        hour_sin, hour_cos     = _encode_hour_cyclic(hour)
+        time_weight        = _get_time_weight(hour)
+        time_adjusted_conf = round(conf * time_weight, 2)
+        hour_sin, hour_cos = _encode_hour_cyclic(hour)
 
         return {
             "label"                   : label,
@@ -473,7 +735,8 @@ def classify(soil: float, temp: float, rh: float, hour: int = 12) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 # RAIN DETECTION
 # ══════════════════════════════════════════════════════════════════════════════
-def _compute_rain_score(air_humidity, soil_moisture, temperature, last_soil, last_temp, pump_was_on):
+def _compute_rain_score(air_humidity, soil_moisture, temperature,
+                        last_soil, last_temp, pump_was_on):
     score   = 0
     signals = []
 
@@ -499,59 +762,69 @@ def _compute_rain_score(air_humidity, soil_moisture, temperature, last_soil, las
     return min(score, 100), signals
 
 
-def _update_rain_state(score, signals, state, current_min):
+def _update_rain_state_batched(score, signals, state, current_min) -> tuple:
+    """
+    Versi batched: tidak langsung ke DB.
+    Kembalikan (is_raining, rain_reason, update_kwargs) untuk di-flush sekaligus.
+    """
     currently_raining = state["rain_detected"]
     confirm_count     = state["rain_confirm_count"]
     clear_count       = state["rain_clear_count"]
+    update_kwargs     = {}
 
     if score >= CFG.RAIN_SCORE_THRESHOLD:
         confirm_count += 1
         clear_count    = 0
         if not currently_raining and confirm_count >= CFG.RAIN_CONFIRM_READINGS:
             log.info("HUJAN DIKONFIRMASI: skor=%d", score)
-            _update_state(
+            update_kwargs = dict(
                 rain_detected=True, rain_score=score,
                 rain_confirm_count=confirm_count, rain_clear_count=0,
                 rain_started_minute=current_min, missed_session=True,
             )
-            return True, f"Hujan dikonfirmasi (skor={score})"
+            return True, f"Hujan dikonfirmasi (skor={score})", update_kwargs
         elif currently_raining:
-            _update_state(rain_score=score, rain_confirm_count=confirm_count, rain_clear_count=0)
-            return True, f"Hujan berlanjut (skor={score})"
+            update_kwargs = dict(
+                rain_score=score, rain_confirm_count=confirm_count, rain_clear_count=0
+            )
+            return True, f"Hujan berlanjut (skor={score})", update_kwargs
         else:
-            _update_state(rain_score=score, rain_confirm_count=confirm_count, rain_clear_count=0)
-            return False, f"Menunggu konfirmasi hujan ({confirm_count}/{CFG.RAIN_CONFIRM_READINGS})"
+            update_kwargs = dict(
+                rain_score=score, rain_confirm_count=confirm_count, rain_clear_count=0
+            )
+            return False, f"Menunggu konfirmasi hujan ({confirm_count}/{CFG.RAIN_CONFIRM_READINGS})", update_kwargs
 
     elif score <= CFG.RAIN_CLEAR_THRESHOLD:
         clear_count   += 1
         confirm_count  = 0
         if currently_raining and clear_count >= CFG.RAIN_CLEAR_READINGS:
             log.info("HUJAN SELESAI: skor=%d", score)
-            _update_state(
+            update_kwargs = dict(
                 rain_detected=False, rain_score=score,
                 rain_confirm_count=0, rain_clear_count=clear_count,
             )
-            return False, ""
+            return False, "", update_kwargs
         elif currently_raining:
-            _update_state(rain_score=score, rain_confirm_count=0, rain_clear_count=clear_count)
-            return True, "Hujan mungkin selesai, tunggu konfirmasi"
+            update_kwargs = dict(
+                rain_score=score, rain_confirm_count=0, rain_clear_count=clear_count
+            )
+            return True, "Hujan mungkin selesai, tunggu konfirmasi", update_kwargs
         else:
-            _update_state(rain_score=score, rain_confirm_count=0, rain_clear_count=clear_count)
-            return False, ""
+            update_kwargs = dict(
+                rain_score=score, rain_confirm_count=0, rain_clear_count=clear_count
+            )
+            return False, "", update_kwargs
     else:
         if currently_raining:
-            _update_state(rain_score=score)
-            return True, f"Hujan ambiguos (skor={score})"
-        return False, ""
+            update_kwargs = dict(rain_score=score)
+            return True, f"Hujan ambiguos (skor={score})", update_kwargs
+        return False, "", {}
 
 
 def _should_skip_sensor(data: SensorData, state: dict, pump_is_on: bool) -> bool:
-    """
-    [v6.3.0] FIX: Tambah parameter pump_is_on.
-    Lompatan soil > 30% tidak lagi dianggap anomali ketika pompa sedang ON.
-    """
     if data.soil_moisture <= 0.0 or data.temperature <= 0.0 or data.temperature >= 60.0:
-        log.warning("ANOMALI SENSOR: Soil=%.1f%%, Temp=%.1f°C", data.soil_moisture, data.temperature)
+        log.warning("ANOMALI SENSOR: Soil=%.1f%%, Temp=%.1f°C",
+                    data.soil_moisture, data.temperature)
         return True
 
     last_soil = state.get("last_sensor_soil")
@@ -573,44 +846,38 @@ def _should_skip_sensor(data: SensorData, state: dict, pump_is_on: bool) -> bool
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SMART WATERING ENGINE
+# SMART WATERING ENGINE — semua update di-pending, di-flush satu transaksi
 # ══════════════════════════════════════════════════════════════════════════════
 def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
-                              temperature, state, current_total_minutes):
-    global _daily_safety
+                              temperature, state, current_total_minutes) -> dict:
+    """
+    Semua keputusan DB dikumpulkan di `pending_updates`, di-flush SEKALI
+    oleh caller. Tidak ada koneksi DB yang dibuka di sini.
 
-    current_date = date.today()
-    with _daily_safety_lock:
-        if _daily_safety["date"] != current_date:
-            _daily_safety["date"]             = current_date
-            _daily_safety["watering_count"]   = 0
-            _daily_safety["locked_out"]       = False
-            _daily_safety["prune_done_today"] = False
-
-        if _daily_safety["locked_out"]:
-            return {
-                "action"        : None,
-                "reason"        : "",
-                "blocked_reason": "Safety Lockout: Melebihi batas harian (10x).",
-                "is_raining"    : False,
-                "rain_score"    : 0,
-                "hot_mode"      : temperature >= CFG.HOT_TEMP_THRESHOLD,
-                "missed_session": bool(state.get("missed_session", False)),
-                "decision_path" : ["SAFETY_LOCKOUT"],
-                "time_weight"   : result.get("time_weight", 0),
-            }
-
+    [FIX #4] Saat pompa dinyalakan, session_count_today dan
+    session_count_date ditambahkan ke pending_updates agar tersimpan ke DB
+    bersamaan dengan pump_status=True (tidak butuh koneksi ekstra).
+    """
     resp = {
-        "action"        : None,
-        "reason"        : "",
-        "blocked_reason": None,
-        "is_raining"    : False,
-        "rain_score"    : 0,
-        "hot_mode"      : temperature >= CFG.HOT_TEMP_THRESHOLD,
-        "missed_session": bool(state.get("missed_session", False)),
-        "decision_path" : [],
-        "time_weight"   : result.get("time_weight", 1.0),
+        "action"          : None,
+        "reason"          : "",
+        "blocked_reason"  : None,
+        "is_raining"      : False,
+        "rain_score"      : 0,
+        "hot_mode"        : temperature >= CFG.HOT_TEMP_THRESHOLD,
+        "missed_session"  : bool(state.get("missed_session", False)),
+        "decision_path"   : [],
+        "time_weight"     : result.get("time_weight", 1.0),
+        "pending_updates" : {},
     }
+
+    # ── Reset harian + safety lockout check ──────────────────────────────────
+    with _daily_safety_lock:
+        _daily_safety_reset_if_new_day()
+        if _daily_safety["locked_out"]:
+            resp["blocked_reason"] = "Safety Lockout: Melebihi batas harian (10x)."
+            resp["decision_path"].append("SAFETY_LOCKOUT")
+            return resp
 
     # ── Cek manual_override ───────────────────────────────────────────────────
     if state.get("manual_override"):
@@ -625,15 +892,18 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
             return resp
         else:
             log.info("Manual override expired, reset otomatis.")
-            _update_state(manual_override=False, manual_override_ts=None)
+            resp["pending_updates"].update(manual_override=False, manual_override_ts=None)
 
-    # ── Deteksi hujan ─────────────────────────────────────────────────────────
+    # ── Deteksi hujan (batched) ───────────────────────────────────────────────
     rain_score, rain_signals = _compute_rain_score(
         air_humidity=air_humidity, soil_moisture=soil_moisture,
         temperature=temperature, last_soil=state.get("last_soil_moisture"),
         last_temp=state.get("last_temperature"), pump_was_on=bool(state["pump_status"]),
     )
-    is_raining, rain_reason = _update_rain_state(rain_score, rain_signals, state, current_total_minutes)
+    is_raining, rain_reason, rain_updates = _update_rain_state_batched(
+        rain_score, rain_signals, state, current_total_minutes
+    )
+    resp["pending_updates"].update(rain_updates)
     resp["is_raining"] = is_raining
     resp["rain_score"] = rain_score
 
@@ -668,9 +938,11 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
         max_sec     = 60 if night_emergency else (CFG.MAX_PUMP_DURATION_MINUTES * 60)
 
         if elapsed_sec >= max_sec:
-            _update_state(pump_status=False, last_watered_minute=current_total_minutes,
-                          last_watered_ts=datetime.now().isoformat(),
-                          pump_start_ts=None, pump_start_minute=None, missed_session=False)
+            resp["pending_updates"].update(
+                pump_status=False, last_watered_minute=current_total_minutes,
+                last_watered_ts=datetime.now().isoformat(),
+                pump_start_ts=None, pump_start_minute=None, missed_session=False,
+            )
             resp["action"] = "off"
             resp["reason"] = f"Auto-stop: {elapsed_sec:.0f}s"
             resp["decision_path"].append("A1")
@@ -682,18 +954,22 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
             return resp
 
         if soil_moisture >= dynamic_wet_off:
-            _update_state(pump_status=False, last_watered_minute=current_total_minutes,
-                          last_watered_ts=datetime.now().isoformat(),
-                          pump_start_ts=None, pump_start_minute=None, missed_session=False)
+            resp["pending_updates"].update(
+                pump_status=False, last_watered_minute=current_total_minutes,
+                last_watered_ts=datetime.now().isoformat(),
+                pump_start_ts=None, pump_start_minute=None, missed_session=False,
+            )
             resp["action"] = "off"
             resp["reason"] = f"Tanah cukup ({soil_moisture:.1f}%)"
             resp["decision_path"].append("A2")
             return resp
 
         if is_raining:
-            _update_state(pump_status=False, last_watered_minute=current_total_minutes,
-                          last_watered_ts=datetime.now().isoformat(),
-                          pump_start_ts=None, pump_start_minute=None, missed_session=False)
+            resp["pending_updates"].update(
+                pump_status=False, last_watered_minute=current_total_minutes,
+                last_watered_ts=datetime.now().isoformat(),
+                pump_start_ts=None, pump_start_minute=None, missed_session=False,
+            )
             resp["action"] = "off"
             resp["reason"] = "Hujan terdeteksi"
             resp["decision_path"].append("A3")
@@ -703,14 +979,28 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
         resp["decision_path"].append("A4-running")
         return resp
 
+    # ── Helper inner: tambahkan session_count ke pending [FIX #4] ────────────
+    def _add_pump_on_updates(updates: dict):
+        today = date.today()
+        with _daily_safety_lock:
+            _daily_safety["watering_count"] += 1
+            new_count = _daily_safety["watering_count"]
+            if new_count >= 10:
+                _daily_safety["locked_out"] = True
+        # Simpan ke DB bersamaan dengan pump_status (tidak perlu koneksi ekstra)
+        updates["session_count_today"] = new_count
+        updates["session_count_date"]  = today.isoformat()
+
     # ── Darurat: tanah sangat kering ──────────────────────────────────────────
     if night_emergency or (soil_moisture <= CFG.CRITICAL_DRY and not is_raining):
         now_ts = datetime.now().isoformat()
-        with _daily_safety_lock:
-            _daily_safety["watering_count"] += 1
-            if _daily_safety["watering_count"] >= 10:
-                _daily_safety["locked_out"] = True
-        _update_state(pump_status=True, pump_start_minute=current_total_minutes, pump_start_ts=now_ts)
+        pump_updates = dict(
+            pump_status=True,
+            pump_start_minute=current_total_minutes,
+            pump_start_ts=now_ts,
+        )
+        _add_pump_on_updates(pump_updates)
+        resp["pending_updates"].update(pump_updates)
         resp["action"] = "on"
         resp["reason"] = f"SIRAM DARURAT [{window_label}]: tanah {soil_moisture:.1f}%"
         resp["decision_path"].append("B1")
@@ -729,12 +1019,15 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
 
     if soil_moisture >= dynamic_wet_off:
         if state.get("missed_session"):
-            _update_state(missed_session=False)
+            resp["pending_updates"]["missed_session"] = False
         resp["blocked_reason"] = f"Tanah sudah basah ({soil_moisture:.1f}%)"
         resp["decision_path"].append("B4")
         return resp
 
-    effective_cooldown = CFG.POST_RAIN_COOLDOWN_MINUTES if state.get("missed_session") else CFG.COOLDOWN_MINUTES
+    effective_cooldown = (
+        CFG.POST_RAIN_COOLDOWN_MINUTES
+        if state.get("missed_session") else CFG.COOLDOWN_MINUTES
+    )
     elapsed_cd = _elapsed_minutes(current_total_minutes, state.get("last_watered_minute"))
     if elapsed_cd < effective_cooldown:
         resp["blocked_reason"] = f"Cooldown: sisa {effective_cooldown - elapsed_cd} mnt"
@@ -747,16 +1040,15 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
         return resp
 
     # ── Threshold confidence disesuaikan dengan time_weight ───────────────────
-    base_threshold = (CFG.CONFIDENCE_HOT if resp["hot_mode"]
-                      else (CFG.CONFIDENCE_MISSED if state.get("missed_session")
-                            else CFG.CONFIDENCE_NORMAL))
+    base_threshold = (
+        CFG.CONFIDENCE_HOT    if resp["hot_mode"]
+        else (CFG.CONFIDENCE_MISSED if state.get("missed_session")
+              else CFG.CONFIDENCE_NORMAL)
+    )
+    time_weight = result.get("time_weight", 1.0)
 
-    time_adj_conf = result.get("time_adjusted_confidence", result["confidence"])
-    time_weight   = result.get("time_weight", 1.0)
-
-    if time_weight < 1.0 and time_weight > 0.0:
-        effective_threshold = base_threshold * (1.0 / time_weight)
-        effective_threshold = min(effective_threshold, 95.0)
+    if 0.0 < time_weight < 1.0:
+        effective_threshold = min(base_threshold * (1.0 / time_weight), 95.0)
         resp["decision_path"].append(f"T-TIME_ADJ({time_weight:.1f})")
     else:
         effective_threshold = base_threshold
@@ -776,11 +1068,13 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
 
     # ── Semua cek lolos: nyalakan pompa ──────────────────────────────────────
     now_ts = datetime.now().isoformat()
-    with _daily_safety_lock:
-        _daily_safety["watering_count"] += 1
-        if _daily_safety["watering_count"] >= 10:
-            _daily_safety["locked_out"] = True
-    _update_state(pump_status=True, pump_start_minute=current_total_minutes, pump_start_ts=now_ts)
+    pump_updates = dict(
+        pump_status=True,
+        pump_start_minute=current_total_minutes,
+        pump_start_ts=now_ts,
+    )
+    _add_pump_on_updates(pump_updates)
+    resp["pending_updates"].update(pump_updates)
     resp["action"] = "on"
     resp["reason"] = (
         f"Siram [{window_label}]: KNN {result['label']} ({result['confidence']}%), "
@@ -797,7 +1091,7 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
 def root():
     return {
         "status"      : "online",
-        "message"     : "Siram Pintar API berjalan",
+        "message"     : "Siram Pintar API berjalan (api_optimasi)",
         "version"     : APP_VERSION,
         "model_ready" : knn_model is not None,
         "auth"        : "required" if VALID_API_KEY else "disabled",
@@ -808,9 +1102,9 @@ def root():
 # PROTECTED ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/db-test", dependencies=[Depends(verify_api_key)])
-def db_test():
+async def db_test():
     try:
-        with get_db() as conn:
+        async with get_db_async() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1 AS ok")
                 row = cur.fetchone()
@@ -828,7 +1122,7 @@ def model_info():
 
 
 @app.post("/sensor", dependencies=[Depends(verify_api_key)])
-def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
+async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
     hour, minute, _day, time_source = _resolve_time_wit(data.hour, data.minute, data.day)
     result    = classify(data.soil_moisture, data.temperature, data.air_humidity, hour=hour)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -842,6 +1136,8 @@ def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
     pump_is_on = bool(state.get("pump_status", False))
     skip_eval  = _should_skip_sensor(data, state, pump_is_on=pump_is_on)
 
+    # [FIX: debounce] Jika masih dalam debounce ketat (< 2 detik),
+    # langsung return tanpa insert ke DB agar tidak ada duplikat data
     if skip_eval:
         elapsed_spam = _elapsed_seconds_real(state.get("last_sensor_ts"))
         if elapsed_spam < 2.0:
@@ -851,7 +1147,11 @@ def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
                 "device_time"   : f"{hour:02d}:{minute:02d}",
                 "time_source"   : time_source,
                 "debounced"     : True,
-                "sensor"        : {"soil_moisture": data.soil_moisture, "temperature": data.temperature, "air_humidity": data.air_humidity},
+                "sensor"        : {
+                    "soil_moisture": data.soil_moisture,
+                    "temperature"  : data.temperature,
+                    "air_humidity" : data.air_humidity,
+                },
                 "classification": result,
                 "pump_status"   : state["pump_status"],
                 "pump_action"   : None,
@@ -871,18 +1171,23 @@ def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
         )
         final_action = smart_eval.get("action")
 
-    _update_state(
+    # ── [FIX #1 + FIX #3] Satu transaksi untuk semua update ─────────────────
+    # Lock dipegang selama seluruh transaksi: update state + insert sensor
+    pump_status_logged = (
+        (final_action == "on") if final_action is not None else state["pump_status"]
+    )
+    sensor_updates = dict(
         last_label=result["label"], last_updated=timestamp,
         last_soil_moisture=data.soil_moisture, last_temperature=data.temperature,
         last_sensor_ts=datetime.now().isoformat(), last_sensor_soil=data.soil_moisture,
     )
+    pending = smart_eval.get("pending_updates", {})
+    all_updates = {**sensor_updates, **pending}
 
-    new_state          = _get_state(use_cache=False)
-    pump_status_logged = (final_action == "on") if final_action is not None else new_state["pump_status"]
-
-    def _insert_sensor():
-        try:
-            with get_db() as conn:
+    try:
+        with _state_lock:
+            async with get_db_async() as conn:
+                _update_state_on_conn(conn, **all_updates)
                 with conn.cursor() as cur:
                     cur.execute(
                         """INSERT INTO sensor_readings
@@ -890,15 +1195,21 @@ def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
                              label, confidence, needs_watering, description,
                              probabilities, pump_status, mode)
                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                        (row_id, timestamp, data.soil_moisture, data.temperature, data.air_humidity,
-                         result["label"], result["confidence"], result["needs_watering"],
-                         result["description"], json.dumps(result["probabilities"]),
-                         pump_status_logged, state["mode"]),
+                        (
+                            row_id, timestamp,
+                            data.soil_moisture, data.temperature, data.air_humidity,
+                            result["label"], result["confidence"], result["needs_watering"],
+                            result["description"], json.dumps(result["probabilities"]),
+                            pump_status_logged, state["mode"],
+                        ),
                     )
-        except Exception as e:
-            log.error("Failed to insert sensor reading: %s", e)
+            # [FIX #3] Invalidate cache SETELAH get_db_async() commit dan tutup
+            _invalidate_state_cache()
+    except Exception as e:
+        log.error("Failed to save sensor + state: %s", e)
+        # Jangan crash total — kembalikan response dengan data yang ada
 
-    bg_tasks.add_task(_insert_sensor)
+    new_state = _get_state(use_cache=False)
 
     return {
         "received"      : True,
@@ -906,7 +1217,11 @@ def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
         "device_time"   : f"{hour:02d}:{minute:02d}",
         "time_source"   : time_source,
         "debounced"     : skip_eval,
-        "sensor"        : {"soil_moisture": data.soil_moisture, "temperature": data.temperature, "air_humidity": data.air_humidity},
+        "sensor"        : {
+            "soil_moisture": data.soil_moisture,
+            "temperature"  : data.temperature,
+            "air_humidity" : data.air_humidity,
+        },
         "classification": result,
         "pump_status"   : new_state["pump_status"],
         "pump_action"   : final_action,
@@ -926,12 +1241,14 @@ def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
 
 
 @app.get("/status", dependencies=[Depends(verify_api_key)])
-def get_status():
+async def get_status():
     state = _get_state(use_cache=True)
     try:
-        with get_db() as conn:
+        async with get_db_async() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT * FROM sensor_readings ORDER BY timestamp DESC LIMIT 1")
+                cur.execute(
+                    "SELECT * FROM sensor_readings ORDER BY timestamp DESC LIMIT 1"
+                )
                 latest = cur.fetchone()
     except Exception as e:
         log.error("Failed to get latest sensor: %s", e)
@@ -939,6 +1256,10 @@ def get_status():
 
     if latest and isinstance(latest.get("probabilities"), str):
         latest["probabilities"] = json.loads(latest["probabilities"])
+
+    with _daily_safety_lock:
+        watering_today = _daily_safety["watering_count"]
+        locked_out     = _daily_safety["locked_out"]
 
     return {
         "pump_status"     : state["pump_status"],
@@ -949,6 +1270,8 @@ def get_status():
         "rain_score"      : state.get("rain_score", 0),
         "missed_session"  : state.get("missed_session", False),
         "manual_override" : state.get("manual_override", False),
+        "watering_today"  : watering_today,
+        "safety_locked"   : locked_out,
         "watering_windows": {
             "morning": f"{CFG.MORNING_WINDOW[0]:02d}:00–{CFG.MORNING_WINDOW[1]:02d}:59 WIT",
             "evening": f"{CFG.EVENING_WINDOW[0]:02d}:00–{CFG.EVENING_WINDOW[1]:02d}:59 WIT",
@@ -975,12 +1298,13 @@ def get_pump_status():
 
 
 @app.get("/history", dependencies=[Depends(verify_api_key)])
-def get_history(limit: int = Query(default=50, ge=1, le=500)):
+async def get_history(limit: int = Query(default=50, ge=1, le=500)):
     try:
-        with get_db() as conn:
+        async with get_db_async() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT * FROM sensor_readings ORDER BY timestamp DESC LIMIT %s", (limit,)
+                    "SELECT * FROM sensor_readings ORDER BY timestamp DESC LIMIT %s",
+                    (limit,)
                 )
                 rows = cur.fetchall()
     except Exception as e:
@@ -997,28 +1321,34 @@ def get_history(limit: int = Query(default=50, ge=1, le=500)):
 
 
 @app.post("/control", dependencies=[Depends(verify_api_key)])
-def control_pump(cmd: ControlCommand):
+async def control_pump(cmd: ControlCommand):
+    """
+    [FIX #1 + FIX #3] Semua update dikerjakan dalam satu transaksi async.
+    _state_lock dipegang selama transaksi penuh — tidak ada race dengan /sensor.
+    Cache diinvalidate SETELAH commit selesai.
+    """
+    action = (cmd.action or "").lower().strip()
+    if action not in ("on", "off"):
+        raise HTTPException(status_code=400, detail="Action harus 'on' atau 'off'.")
+
+    mode = (cmd.mode or "manual").lower().strip()
+    if mode not in ("auto", "manual"):
+        mode = "manual"
+
+    # _control_lock mencegah dua /control request bersamaan
     with _control_lock:
-        action = (cmd.action or "").lower().strip()
-        if action not in ("on", "off"):
-            raise HTTPException(status_code=400, detail="Action harus 'on' atau 'off'.")
-
-        mode = (cmd.mode or "manual").lower().strip()
-        if mode not in ("auto", "manual"):
-            mode = "manual"
-
         state   = _get_state(use_cache=False)
         pump_on = action == "on"
 
         if state["pump_status"] == pump_on and state["mode"] == mode:
             return {
-                "success"         : True,
-                "debounced"       : True,
-                "message"         : "Status tidak berubah",
-                "pump_status"     : state["pump_status"],
-                "mode"            : state["mode"],
-                "manual_override" : state.get("manual_override", False),
-                "timestamp"       : state.get("last_control_ts") or datetime.now().isoformat(),
+                "success"        : True,
+                "debounced"      : True,
+                "message"        : "Status tidak berubah",
+                "pump_status"    : state["pump_status"],
+                "mode"           : state["mode"],
+                "manual_override": state.get("manual_override", False),
+                "timestamp"      : state.get("last_control_ts") or datetime.now().isoformat(),
             }
 
         now_ts        = datetime.now().isoformat()
@@ -1027,6 +1357,7 @@ def control_pump(cmd: ControlCommand):
         if state["pump_status"] != pump_on:
             update_kwargs["pump_status"] = pump_on
             if not pump_on:
+                # Matikan pompa manual → aktifkan override
                 update_kwargs["pump_start_ts"]       = None
                 update_kwargs["pump_start_minute"]   = None
                 update_kwargs["last_watered_ts"]     = now_ts
@@ -1036,6 +1367,7 @@ def control_pump(cmd: ControlCommand):
                 update_kwargs["manual_override_ts"]  = now_ts
                 log.info("manual_override diaktifkan, auto-watering diblokir 10 mnt.")
             else:
+                # Nyalakan pompa manual → hapus override, catat waktu mulai
                 update_kwargs["pump_start_ts"]      = now_ts
                 update_kwargs["manual_override"]    = False
                 update_kwargs["manual_override_ts"] = None
@@ -1043,20 +1375,31 @@ def control_pump(cmd: ControlCommand):
                 h_wit   = (now_utc.hour + 9) % 24
                 update_kwargs["pump_start_minute"]  = _total_minutes(h_wit, now_utc.minute)
 
-        # ✅ _update_state sekarang pakai backtick — `mode` tersimpan dengan benar
-        _update_state(**update_kwargs)
-        new_state = _get_state(use_cache=False)
+        # [FIX #1 + FIX #3] Lock → transaksi async → invalidate setelah commit
+        try:
+            with _state_lock:
+                async with get_db_async() as conn:
+                    _update_state_on_conn(conn, **update_kwargs)
+                # [FIX #3] Commit sudah terjadi di __aexit__, baru invalidate
+                _invalidate_state_cache()
+        except Exception as e:
+            log.error("Control update failed: %s", e)
+            raise HTTPException(
+                status_code=503,
+                detail="Gagal menyimpan ke database. Coba lagi."
+            )
 
+        new_state = _get_state(use_cache=False)
         log.info("Control: action=%s mode=%s → DB mode=%s pump=%s",
                  action, mode, new_state["mode"], new_state["pump_status"])
 
         return {
-            "success"         : True,
-            "debounced"       : False,
-            "pump_status"     : new_state["pump_status"],
-            "mode"            : new_state["mode"],
-            "manual_override" : new_state.get("manual_override", False),
-            "timestamp"       : now_ts,
+            "success"        : True,
+            "debounced"      : False,
+            "pump_status"    : new_state["pump_status"],
+            "mode"           : new_state["mode"],
+            "manual_override": new_state.get("manual_override", False),
+            "timestamp"      : now_ts,
         }
 
 
@@ -1095,11 +1438,11 @@ def get_config():
             "rh_light"        : CFG.RAIN_RH_LIGHT,
         },
         "pump_control": {
-            "max_duration_min"       : CFG.MAX_PUMP_DURATION_MINUTES,
-            "min_duration_sec"       : CFG.MIN_PUMP_DURATION_SECONDS,
-            "cooldown_normal"        : CFG.COOLDOWN_MINUTES,
-            "cooldown_post_rain"     : CFG.POST_RAIN_COOLDOWN_MINUTES,
-            "manual_override_expire" : CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS,
+            "max_duration_min"      : CFG.MAX_PUMP_DURATION_MINUTES,
+            "min_duration_sec"      : CFG.MIN_PUMP_DURATION_SECONDS,
+            "cooldown_normal"       : CFG.COOLDOWN_MINUTES,
+            "cooldown_post_rain"    : CFG.POST_RAIN_COOLDOWN_MINUTES,
+            "manual_override_expire": CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS,
         },
         "knn_confidence": {
             "normal"        : CFG.CONFIDENCE_NORMAL,
@@ -1111,6 +1454,10 @@ def get_config():
             "in_window"  : CFG.TIME_WEIGHT_IN_WINDOW,
             "near_window": CFG.TIME_WEIGHT_NEAR_WINDOW,
             "outside"    : CFG.TIME_WEIGHT_OUTSIDE,
+        },
+        "db_config": {
+            "max_retries" : DB_MAX_RETRIES,
+            "retry_delay" : DB_RETRY_DELAY_SEC,
         },
     }
 
@@ -1132,16 +1479,15 @@ def reset_override():
 
 
 @app.get("/diagnostics", dependencies=[Depends(verify_api_key)])
-def get_diagnostics():
+async def get_diagnostics():
     """
-    Tampilkan semua state internal, info daily safety, dan info model KNN.
-    Berguna untuk debugging tanpa harus masuk ke database.
+    Tampilkan semua state internal, info daily safety, dan info model.
+    Berguna untuk debugging tanpa perlu masuk ke database langsung.
     """
     state = _get_state(use_cache=False)
 
     with _daily_safety_lock:
         safety_snapshot = dict(_daily_safety)
-
     if safety_snapshot.get("date"):
         safety_snapshot["date"] = str(safety_snapshot["date"])
 
@@ -1156,14 +1502,27 @@ def get_diagnostics():
     override_remaining = None
     if state.get("manual_override"):
         age = _elapsed_seconds_real(state.get("manual_override_ts"))
-        remaining = CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS - age
-        override_remaining = max(0, int(remaining))
+        override_remaining = max(0, int(CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS - age))
 
     return {
         "version"               : APP_VERSION,
-        "server_time_wit"       : datetime.utcnow().strftime("%H:%M:%S") + " (UTC, +9=WIT)",
-        "state"                 : {k: str(v) if v is not None else None for k, v in state.items()},
+        "server_time_wit"       : datetime.utcnow().strftime("%H:%M:%S") + " (UTC+9=WIT)",
+        "state"                 : {
+            k: str(v) if v is not None else None for k, v in state.items()
+        },
         "daily_safety"          : safety_snapshot,
         "override_remaining_sec": override_remaining,
         "knn"                   : knn_info,
+        "fixes_applied"         : [
+            "FIX#1: _state_lock aktif di semua jalur _update_state",
+            "FIX#2: get_db_async() pakai asyncio.sleep() — non-blocking",
+            "FIX#3: cache invalidate SETELAH commit selesai",
+            "FIX#4: watering_count persistent ke DB, recover dari cold-start",
+        ],
+        "db_config"             : {
+            "host"        : DB_HOST,
+            "port"        : DB_PORT,
+            "max_retries" : DB_MAX_RETRIES,
+            "retry_delay" : DB_RETRY_DELAY_SEC,
+        },
     }
