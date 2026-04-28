@@ -42,8 +42,13 @@ VALID_API_KEY  = os.environ.get("API_KEY", "")
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 # ── Versi ─────────────────────────────────────────────────────────────────────
-APP_VERSION = "6.3.0"
-# Changelog v6.3.0:
+APP_VERSION = "6.3.1"
+# Changelog v6.3.1:
+#   - [BUG FIX CRITICAL] _update_state: tambah backtick pada nama kolom
+#     agar aman dari reserved keyword MySQL (terutama kolom `mode`).
+#     Sebelumnya UPDATE SET mode = 'manual' gagal silent karena `mode`
+#     adalah reserved word MySQL — menyebabkan mode tidak pernah tersimpan
+#     dan selalu kembali ke 'auto'.
 #   - [BUG FIX] Perbaikan _prune_sensor_readings_async: tidak lagi dipicu
 #     tiap request, sekarang dijadwalkan sekali per hari via flag harian
 #   - [BUG FIX] open(META_PATH) sekarang memakai context manager 'with'
@@ -83,7 +88,6 @@ _daily_safety = {
     "watering_count"      : 0,
     "locked_out"          : False,
     "last_pump_duration_sec": 0,
-    # [v6.3.0] Flag untuk jadwal pruning harian
     "prune_done_today"    : False,
 }
 
@@ -176,12 +180,9 @@ class WateringConfig:
 
     MANUAL_OVERRIDE_EXPIRE_SECONDS = 600  # 10 menit
 
-    # [v6.3.0] Bobot waktu untuk KNN time-awareness
-    # Nilai 1.0 = jam aman penuh, 0.0 = tidak boleh siram sama sekali
-    # Ini TIDAK mengubah model KNN, hanya mempengaruhi threshold confidence
-    TIME_WEIGHT_IN_WINDOW   = 1.0   # jam siram normal
-    TIME_WEIGHT_NEAR_WINDOW = 0.7   # 1 jam sebelum/sesudah window
-    TIME_WEIGHT_OUTSIDE     = 0.0   # di luar jam aman (kecuali darurat)
+    TIME_WEIGHT_IN_WINDOW   = 1.0
+    TIME_WEIGHT_NEAR_WINDOW = 0.7
+    TIME_WEIGHT_OUTSIDE     = 0.0
 
 
 CFG = WateringConfig()
@@ -219,7 +220,6 @@ async def startup():
     try:
         knn_model = joblib.load(MODEL_PATH)
         scaler    = joblib.load(SCALER_PATH)
-        # [v6.3.0] FIX: pakai 'with' agar file handle tidak bocor
         if os.path.exists(META_PATH):
             with open(META_PATH, "r") as f:
                 model_meta = json.load(f)
@@ -290,39 +290,18 @@ def _in_watering_window(hour: int) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# [v6.3.0] HELPER: Encoding jam untuk KNN time-awareness
+# HELPER: Encoding jam untuk KNN time-awareness
 # ══════════════════════════════════════════════════════════════════════════════
 def _encode_hour_cyclic(hour: int) -> tuple:
-    """
-    Ubah jam (0-23) menjadi dua nilai sin dan cos.
-    Tujuan: KNN memahami bahwa jam 23 dan jam 0 itu dekat (bukan jauh).
-    Contoh: hour=0  → sin=0.0,  cos=1.0
-            hour=6  → sin=1.0,  cos=0.0
-            hour=12 → sin=0.0,  cos=-1.0
-            hour=18 → sin=-1.0, cos=0.0
-    Kedua nilai ini bisa ditambahkan sebagai fitur KNN tambahan
-    jika model diretrain. Sementara ini digunakan sebagai time_weight.
-    """
     angle = 2 * np.pi * hour / 24
     return float(np.sin(angle)), float(np.cos(angle))
 
 
 def _get_time_weight(hour: int) -> float:
-    """
-    Hitung bobot waktu (0.0–1.0) berdasarkan seberapa 'cocok' jam sekarang
-    untuk menyiram. Ini TIDAK mengubah model KNN, tapi mempengaruhi
-    threshold confidence yang dibutuhkan sebelum pompa dinyalakan.
-
-    Logika:
-    - Dalam window siram (pagi/sore)           → weight 1.0 (full)
-    - 1 jam sebelum/sesudah window             → weight 0.7 (hampir aman)
-    - Di luar itu                              → weight 0.0 (blokir)
-    """
     in_window, _ = _in_watering_window(hour)
     if in_window:
         return CFG.TIME_WEIGHT_IN_WINDOW
 
-    # Cek apakah 1 jam sebelum atau sesudah window
     morning_start = CFG.MORNING_WINDOW[0]
     morning_end   = CFG.MORNING_WINDOW[1]
     evening_start = CFG.EVENING_WINDOW[0]
@@ -407,15 +386,27 @@ def _get_state(use_cache=True) -> dict:
 
 
 def _update_state(**kwargs):
+    """
+    [v6.3.1] BUG FIX CRITICAL: Tambah backtick pada nama kolom.
+    Sebelumnya kolom `mode` gagal di-update karena MODE adalah reserved
+    keyword di MySQL. Query tanpa backtick:
+        UPDATE system_state SET mode = 'manual' WHERE id = 1
+    Gagal silent — MySQL menolak tapi exception tidak di-raise dengan jelas.
+    Fix: gunakan backtick untuk semua nama kolom:
+        UPDATE system_state SET `mode` = 'manual' WHERE id = 1
+    """
     if not kwargs:
         return
     try:
         with _state_lock:
-            sets   = ", ".join(f"{k} = %s" for k in kwargs)
+            # ✅ FIX: backtick pada nama kolom agar aman dari reserved keywords MySQL
+            sets   = ", ".join(f"`{k}` = %s" for k in kwargs)
             values = list(kwargs.values())
             with get_db() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(f"UPDATE system_state SET {sets} WHERE id = 1", values)
+                    cur.execute(
+                        f"UPDATE system_state SET {sets} WHERE id = 1", values
+                    )
         with _state_cache_lock:
             _state_cache["timestamp"] = 0
     except Exception as e:
@@ -424,9 +415,7 @@ def _update_state(**kwargs):
 
 def _prune_sensor_readings_async():
     """
-    [v6.3.0] FIX: Pruning dijadwalkan sekali per hari via _daily_safety flag,
-    bukan berdasarkan elapsed sensor. Sebelumnya kondisi > 3600 detik
-    tidak pernah tercapai karena sensor aktif terus setiap 30 detik.
+    [v6.3.0] FIX: Pruning dijadwalkan sekali per hari via _daily_safety flag.
     """
     try:
         with get_db() as conn:
@@ -445,7 +434,6 @@ def _maybe_schedule_prune(bg_tasks: BackgroundTasks):
     current_date = date.today()
     with _daily_safety_lock:
         if _daily_safety["date"] != current_date:
-            # Reset semua counter harian
             _daily_safety["date"]            = current_date
             _daily_safety["watering_count"]  = 0
             _daily_safety["locked_out"]      = False
@@ -460,20 +448,6 @@ def _maybe_schedule_prune(bg_tasks: BackgroundTasks):
 # KNN Classify — v6.3.0: time-aware confidence adjustment
 # ══════════════════════════════════════════════════════════════════════════════
 def classify(soil: float, temp: float, rh: float, hour: int = 12) -> dict:
-    """
-    Klasifikasi kondisi tanah menggunakan KNN.
-
-    [v6.3.0] Tambahan parameter 'hour':
-    - Model KNN tetap memakai 3 fitur (soil, temp, rh) — tidak perlu retraining
-    - 'hour' digunakan untuk menghitung 'time_weight' yang mempengaruhi
-      seberapa tinggi confidence yang dibutuhkan untuk memutuskan siram
-    - time_adjusted_confidence = confidence * time_weight
-      Contoh: KNN bilang Kering 70% di jam 23 malam
-              time_weight jam 23 = 0.0 (luar window)
-              time_adjusted_confidence = 70% * 0.0 = 0%
-              → sistem tidak akan menyiram malam hari
-    - Ini lapisan keamanan tambahan di atas logika window yang sudah ada
-    """
     if knn_model is None or scaler is None:
         raise HTTPException(status_code=503, detail="Model KNN belum dimuat.")
     try:
@@ -483,21 +457,20 @@ def classify(soil: float, temp: float, rh: float, hour: int = 12) -> dict:
         confs = {cls: round(float(p) * 100, 2) for cls, p in zip(knn_model.classes_, proba)}
         conf  = round(float(max(proba)) * 100, 2)
 
-        # [v6.3.0] Hitung time_weight dan time_adjusted_confidence
         time_weight            = _get_time_weight(hour)
         time_adjusted_conf     = round(conf * time_weight, 2)
         hour_sin, hour_cos     = _encode_hour_cyclic(hour)
 
         return {
-            "label"                 : label,
-            "confidence"            : conf,
-            "time_weight"           : time_weight,
+            "label"                   : label,
+            "confidence"              : conf,
+            "time_weight"             : time_weight,
             "time_adjusted_confidence": time_adjusted_conf,
-            "hour_sin"              : hour_sin,
-            "hour_cos"              : hour_cos,
-            "probabilities"         : confs,
-            "needs_watering"        : label == "Kering",
-            "description"           : model_meta.get("label_desc", {}).get(label, ""),
+            "hour_sin"                : hour_sin,
+            "hour_cos"                : hour_cos,
+            "probabilities"           : confs,
+            "needs_watering"          : label == "Kering",
+            "description"             : model_meta.get("label_desc", {}).get(label, ""),
         }
     except Exception as e:
         log.error("KNN classify error: %s", e)
@@ -582,9 +555,7 @@ def _update_rain_state(score, signals, state, current_min):
 def _should_skip_sensor(data: SensorData, state: dict, pump_is_on: bool) -> bool:
     """
     [v6.3.0] FIX: Tambah parameter pump_is_on.
-    Lompatan soil > 30% tidak lagi dianggap anomali ketika pompa sedang ON,
-    karena memang wajar tanah naik cepat saat sedang disiram.
-    Sebelumnya data valid saat siram bisa di-skip karena dianggap anomali.
+    Lompatan soil > 30% tidak lagi dianggap anomali ketika pompa sedang ON.
     """
     if data.soil_moisture <= 0.0 or data.temperature <= 0.0 or data.temperature >= 60.0:
         log.warning("ANOMALI SENSOR: Soil=%.1f%%, Temp=%.1f°C", data.soil_moisture, data.temperature)
@@ -593,7 +564,6 @@ def _should_skip_sensor(data: SensorData, state: dict, pump_is_on: bool) -> bool
     last_soil = state.get("last_sensor_soil")
     if last_soil is not None and abs(data.soil_moisture - float(last_soil)) > 30.0:
         if pump_is_on:
-            # Lonjakan saat pompa ON adalah data valid, jangan skip
             log.debug("Lonjakan tanah saat pompa ON (%.1f%% → %.1f%%) — valid",
                       float(last_soil), data.soil_moisture)
         else:
@@ -619,9 +589,9 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
     current_date = date.today()
     with _daily_safety_lock:
         if _daily_safety["date"] != current_date:
-            _daily_safety["date"]            = current_date
-            _daily_safety["watering_count"]  = 0
-            _daily_safety["locked_out"]      = False
+            _daily_safety["date"]             = current_date
+            _daily_safety["watering_count"]   = 0
+            _daily_safety["locked_out"]       = False
             _daily_safety["prune_done_today"] = False
 
         if _daily_safety["locked_out"]:
@@ -783,11 +753,7 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
         resp["decision_path"].append("B6")
         return resp
 
-    # ── [v6.3.0] Threshold confidence disesuaikan dengan time_weight ──────────
-    # time_adjusted_confidence = confidence_KNN * time_weight
-    # Misal: KNN bilang Kering 65% tapi di jam 23 (time_weight=0.0)
-    #        → time_adjusted = 0% → tidak akan lolos threshold manapun
-    # Ini membuat KNN "sadar waktu" tanpa perlu retraining model
+    # ── Threshold confidence disesuaikan dengan time_weight ───────────────────
     base_threshold = (CFG.CONFIDENCE_HOT if resp["hot_mode"]
                       else (CFG.CONFIDENCE_MISSED if state.get("missed_session")
                             else CFG.CONFIDENCE_NORMAL))
@@ -796,7 +762,6 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
     time_weight   = result.get("time_weight", 1.0)
 
     if time_weight < 1.0 and time_weight > 0.0:
-        # Zona transisi (near window): naikkan threshold agar lebih konservatif
         effective_threshold = base_threshold * (1.0 / time_weight)
         effective_threshold = min(effective_threshold, 95.0)
         resp["decision_path"].append(f"T-TIME_ADJ({time_weight:.1f})")
@@ -871,7 +836,6 @@ def model_info():
 
 @app.post("/sensor", dependencies=[Depends(verify_api_key)])
 def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
-    # [v6.3.0] Kirim jam ke classify() agar time-aware
     hour, minute, _day, time_source = _resolve_time_wit(data.hour, data.minute, data.day)
     result    = classify(data.soil_moisture, data.temperature, data.air_humidity, hour=hour)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -880,10 +844,8 @@ def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
     state = _get_state(use_cache=True)
     current_total_minutes = _total_minutes(hour, minute)
 
-    # [v6.3.0] FIX: Pruning dijadwalkan sekali per hari, bukan per request
     _maybe_schedule_prune(bg_tasks)
 
-    # [v6.3.0] FIX: Kirim pump_is_on ke _should_skip_sensor
     pump_is_on = bool(state.get("pump_status", False))
     skip_eval  = _should_skip_sensor(data, state, pump_is_on=pump_is_on)
 
@@ -1088,8 +1050,12 @@ def control_pump(cmd: ControlCommand):
                 h_wit   = (now_utc.hour + 9) % 24
                 update_kwargs["pump_start_minute"]  = _total_minutes(h_wit, now_utc.minute)
 
+        # ✅ _update_state sekarang pakai backtick — `mode` tersimpan dengan benar
         _update_state(**update_kwargs)
         new_state = _get_state(use_cache=False)
+
+        log.info("Control: action=%s mode=%s → DB mode=%s pump=%s",
+                 action, mode, new_state["mode"], new_state["pump_status"])
 
         return {
             "success"         : True,
@@ -1172,7 +1138,6 @@ def reset_override():
     return {"success": True, "message": "Manual override di-reset. Auto-watering aktif kembali."}
 
 
-# ── [v6.3.0] Endpoint diagnostics untuk debug tanpa cek DB langsung ──────────
 @app.get("/diagnostics", dependencies=[Depends(verify_api_key)])
 def get_diagnostics():
     """
@@ -1184,11 +1149,9 @@ def get_diagnostics():
     with _daily_safety_lock:
         safety_snapshot = dict(_daily_safety)
 
-    # Konversi date ke string agar JSON serializable
     if safety_snapshot.get("date"):
         safety_snapshot["date"] = str(safety_snapshot["date"])
 
-    # Info KNN
     knn_info = {
         "model_loaded"  : knn_model is not None,
         "scaler_loaded" : scaler is not None,
@@ -1197,7 +1160,6 @@ def get_diagnostics():
         "time_awareness": "via time_weight multiplier (no retraining needed)",
     }
 
-    # Hitung manual_override sisa waktu
     override_remaining = None
     if state.get("manual_override"):
         age = _elapsed_seconds_real(state.get("manual_override_ts"))
@@ -1205,10 +1167,10 @@ def get_diagnostics():
         override_remaining = max(0, int(remaining))
 
     return {
-        "version"           : APP_VERSION,
-        "server_time_wit"   : datetime.utcnow().strftime("%H:%M:%S") + " (UTC, +9=WIT)",
-        "state"             : {k: str(v) if v is not None else None for k, v in state.items()},
-        "daily_safety"      : safety_snapshot,
+        "version"               : APP_VERSION,
+        "server_time_wit"       : datetime.utcnow().strftime("%H:%M:%S") + " (UTC, +9=WIT)",
+        "state"                 : {k: str(v) if v is not None else None for k, v in state.items()},
+        "daily_safety"          : safety_snapshot,
         "override_remaining_sec": override_remaining,
-        "knn"               : knn_info,
+        "knn"                   : knn_info,
     }
