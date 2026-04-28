@@ -10,8 +10,8 @@ from typing import Optional
 from contextlib import contextmanager
 import time
 
-import firebase_admin
-from firebase_admin import credentials, db as firebase_db
+import pymysql
+import pymysql.cursors
 from fastapi import FastAPI, HTTPException, Query, Security, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
@@ -30,32 +30,39 @@ MODEL_PATH  = os.path.join(BASE_DIR, "model", "knn_model.pkl")
 SCALER_PATH = os.path.join(BASE_DIR, "model", "scaler.pkl")
 META_PATH   = os.path.join(BASE_DIR, "model", "model_info.json")
 
-# ── Firebase config ───────────────────────────────────────────────────────────
-# Opsi 1: path ke file JSON service account
-FIREBASE_CRED_PATH = os.environ.get(
-    "FIREBASE_CRED_PATH",
-    os.path.join(BASE_DIR, "iot-project-8494e-firebase-adminsdk-fbsvc-0e27f8d960.json")
-)
-# Opsi 2: database URL Firebase Realtime Database
-FIREBASE_DB_URL = os.environ.get(
-    "FIREBASE_DB_URL",
-    "https://iot-project-8494e-default-rtdb.asia-southeast1.firebasedatabase.app"
-)
+# ── MySQL config ──────────────────────────────────────────────────────────────
+DB_HOST = os.environ.get("DB_HOST", "srv1987.hstgr.io")
+DB_PORT = int(os.environ.get("DB_PORT", 3306))
+DB_USER = os.environ.get("DB_USER", "")
+DB_PASS = os.environ.get("DB_PASS", "")
+DB_NAME = os.environ.get("DB_NAME", "")
 
 # ── API Key ───────────────────────────────────────────────────────────────────
 VALID_API_KEY  = os.environ.get("API_KEY", "")
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 # ── Versi ─────────────────────────────────────────────────────────────────────
-APP_VERSION = "7.0.0"
-# Changelog v7.0.0:
-#   - [MIGRATION] Migrasi penuh dari MySQL (pymysql) ke Firebase Realtime Database
-#   - [CHANGE] get_db() context manager diganti dengan helper Firebase langsung
-#   - [CHANGE] system_state disimpan di /system_state node Firebase
-#   - [CHANGE] sensor_readings disimpan di /sensor_readings node Firebase
-#   - [CHANGE] Pruning sensor_readings menggunakan query orderByKey + limitToFirst
-#   - [KEEP] Semua logika bisnis, KNN, rain detection, smart watering tetap sama
-#   - [KEEP] API key protection, CORS, endpoint struktur tetap sama
+APP_VERSION = "6.3.1"
+# Changelog v6.3.1:
+#   - [BUG FIX CRITICAL] _update_state: tambah backtick pada nama kolom
+#     agar aman dari reserved keyword MySQL (terutama kolom `mode`).
+#     Sebelumnya UPDATE SET mode = 'manual' gagal silent karena `mode`
+#     adalah reserved word MySQL — menyebabkan mode tidak pernah tersimpan
+#     dan selalu kembali ke 'auto'.
+#   - [BUG FIX] Perbaikan _prune_sensor_readings_async: tidak lagi dipicu
+#     tiap request, sekarang dijadwalkan sekali per hari via flag harian
+#   - [BUG FIX] open(META_PATH) sekarang memakai context manager 'with'
+#     agar file handle tidak bocor (file handle leak)
+#   - [BUG FIX] _should_skip_sensor: lompatan soil > 30% tidak lagi
+#     dianggap anomali ketika pompa sedang ON (data valid saat siram)
+#   - [IMPROVE] classify() sekarang menerima fitur 'hour' (jam WIT) sebagai
+#     fitur ke-4 untuk KNN, sehingga model sadar waktu pagi/sore/malam
+#   - [IMPROVE] Tambah fungsi _encode_hour_cyclic() untuk encoding jam
+#     menjadi sin+cos agar KNN memahami jam 23 dekat dengan jam 0
+#   - [IMPROVE] Skor KNN kini digabungkan dengan bobot waktu (time_weight)
+#     sebelum keputusan akhir, menambah lapisan logika tanpa retraining model
+#   - [IMPROVE] Tambah endpoint GET /diagnostics untuk melihat semua state
+#     dan info debug tanpa perlu cek database langsung
 
 
 async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
@@ -86,64 +93,50 @@ _daily_safety = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FIREBASE INIT & HELPER
+# DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
-_firebase_initialized = False
+def _create_connection():
+    """Buat satu koneksi baru ke MySQL."""
+    return pymysql.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        connect_timeout=10,
+        ssl={"ssl": {}},
+        autocommit=False,
+    )
 
-def _init_firebase():
-    global _firebase_initialized
-    if _firebase_initialized:
-        return
+
+@contextmanager
+def get_db():
+    """
+    Context manager: buka koneksi → yield → commit/rollback → tutup.
+    Koneksi dibuka per-request dan langsung ditutup setelah selesai.
+    """
+    conn = None
     try:
-        cred = credentials.Certificate(FIREBASE_CRED_PATH)
-        firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
-        _firebase_initialized = True
-        log.info("Firebase initialized: %s", FIREBASE_DB_URL)
-    except Exception as e:
-        log.error("Gagal init Firebase: %s", e)
+        conn = _create_connection()
+        yield conn
+        conn.commit()
+    except HTTPException:
+        if conn:
+            conn.rollback()
         raise
-
-
-def _fb_ref(path: str):
-    """Shortcut ambil Firebase reference."""
-    return firebase_db.reference(path)
-
-
-def _fb_get(path: str):
-    """Baca data dari Firebase. Return None jika tidak ada."""
-    try:
-        return _fb_ref(path).get()
     except Exception as e:
-        log.error("Firebase GET error [%s]: %s", path, e)
-        raise HTTPException(status_code=503, detail="Firebase unavailable")
-
-
-def _fb_set(path: str, data: dict):
-    """Tulis/replace data ke path Firebase."""
-    try:
-        _fb_ref(path).set(data)
-    except Exception as e:
-        log.error("Firebase SET error [%s]: %s", path, e)
-        raise HTTPException(status_code=503, detail="Firebase unavailable")
-
-
-def _fb_update(path: str, data: dict):
-    """Update sebagian field di path Firebase."""
-    try:
-        _fb_ref(path).update(data)
-    except Exception as e:
-        log.error("Firebase UPDATE error [%s]: %s", path, e)
-        raise HTTPException(status_code=503, detail="Firebase unavailable")
-
-
-def _fb_push(path: str, data: dict) -> str:
-    """Push data baru ke path Firebase. Return key yang dibuat."""
-    try:
-        ref = _fb_ref(path).push(data)
-        return ref.key
-    except Exception as e:
-        log.error("Firebase PUSH error [%s]: %s", path, e)
-        raise HTTPException(status_code=503, detail="Firebase unavailable")
+        if conn:
+            conn.rollback()
+        log.error("DB error: %s", e)
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -197,7 +190,7 @@ CFG = WateringConfig()
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Siram Pintar API",
-    description="Sistem Penyiraman Tanaman IoT — KNN + Logika Cuaca Adaptif (Firebase)",
+    description="Sistem Penyiraman Tanaman IoT — KNN + Logika Cuaca Adaptif",
     version=APP_VERSION,
 )
 app.add_middleware(
@@ -215,15 +208,7 @@ model_meta: dict = {}
 @app.on_event("startup")
 async def startup():
     global knn_model, scaler, model_meta
-
     log.info("Siram Pintar API v%s starting...", APP_VERSION)
-
-    # Init Firebase
-    _init_firebase()
-
-    # Pastikan node system_state ada di Firebase
-    _ensure_state_node()
-
     if VALID_API_KEY:
         log.info("API Key protection: AKTIF (key: %s***)", VALID_API_KEY[:2])
     else:
@@ -332,7 +317,7 @@ def _get_time_weight(hour: int) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STATE MANAGEMENT — Firebase Realtime Database
+# STATE MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 _STATE_DEFAULTS = {
     "pump_status"          : False,
@@ -360,50 +345,8 @@ _STATE_DEFAULTS = {
     "manual_override_ts"   : None,
 }
 
-_STATE_PATH = "system_state"
-
 _state_cache      = {"data": None, "timestamp": 0}
 _state_cache_lock = threading.Lock()
-
-
-def _ensure_state_node():
-    """Buat node system_state di Firebase jika belum ada."""
-    try:
-        existing = _fb_get(_STATE_PATH)
-        if existing is None:
-            log.info("system_state node belum ada, membuat default...")
-            _fb_set(_STATE_PATH, _STATE_DEFAULTS)
-            log.info("system_state default berhasil dibuat.")
-        else:
-            log.info("system_state node sudah ada.")
-    except Exception as e:
-        log.error("Gagal ensure state node: %s", e)
-
-
-def _sanitize_state(raw: dict) -> dict:
-    """Normalisasi tipe data dari Firebase (semua boolean/int bisa jadi string/None)."""
-    if not raw:
-        return dict(_STATE_DEFAULTS)
-
-    row = dict(raw)
-
-    for bool_key in ("pump_status", "missed_session", "rain_detected", "manual_override"):
-        val = row.get(bool_key)
-        if val is None:
-            row[bool_key] = False
-        else:
-            row[bool_key] = bool(val)
-
-    for int_key in ("rain_score", "rain_confirm_count", "rain_clear_count", "session_count_today"):
-        val = row.get(int_key)
-        row[int_key] = int(val) if val is not None else 0
-
-    # Pastikan semua key default ada
-    for k, v in _STATE_DEFAULTS.items():
-        if k not in row:
-            row[k] = v
-
-    return row
 
 
 def _get_state(use_cache=True) -> dict:
@@ -415,11 +358,24 @@ def _get_state(use_cache=True) -> dict:
                 return _state_cache["data"].copy()
 
     try:
-        raw = _fb_get(_STATE_PATH)
-        row = _sanitize_state(raw)
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM system_state WHERE id = 1")
+                row = cur.fetchone()
     except Exception as e:
         log.error("Failed to get state: %s", e)
         return dict(_STATE_DEFAULTS)
+
+    if not row:
+        row = dict(_STATE_DEFAULTS)
+    else:
+        for bool_key in ("pump_status", "missed_session", "rain_detected", "manual_override"):
+            row[bool_key] = bool(row.get(bool_key, False))
+        for int_key in ("rain_score", "rain_confirm_count", "rain_clear_count", "session_count_today"):
+            row[int_key] = int(row.get(int_key) or 0)
+        for k, v in _STATE_DEFAULTS.items():
+            if k not in row:
+                row[k] = v
 
     if use_cache:
         with _state_cache_lock:
@@ -430,55 +386,38 @@ def _get_state(use_cache=True) -> dict:
 
 
 def _update_state(**kwargs):
-    """Update field tertentu di system_state Firebase."""
     if not kwargs:
         return
     try:
         with _state_lock:
-            _fb_update(_STATE_PATH, kwargs)
-            log.info("_update_state keys=%s", list(kwargs.keys()))
+            sets   = ", ".join(f"`{k}` = %s" for k in kwargs)
+            values = list(kwargs.values())
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"UPDATE system_state SET {sets} WHERE id = 1", values
+                    )
+                    affected = cur.rowcount  # ← tambah ini
+                    log.info("_update_state affected=%d | keys=%s", affected, list(kwargs.keys()))
         with _state_cache_lock:
-            _state_cache["timestamp"] = 0  # invalidate cache
+            _state_cache["timestamp"] = 0
     except Exception as e:
         log.error("Failed to update state: %s | kwargs=%s", e, list(kwargs.keys()))
-        raise
+        raise  # ← TAMBAH INI — paling penting!
 
 
 def _prune_sensor_readings_async():
     """
-    Hapus sensor readings lama (> 14 hari).
-    Firebase tidak punya DELETE WHERE timestamp < X,
-    jadi kita baca semua key, filter yang lama, lalu hapus per key.
-    Batasi max 1000 hapus per prune agar tidak overload.
+    [v6.3.0] FIX: Pruning dijadwalkan sekali per hari via _daily_safety flag.
     """
     try:
-        cutoff = datetime.now().timestamp() - (14 * 24 * 3600)  # 14 hari lalu (epoch)
-        # Ambil semua key (hanya key, bukan value, pakai shallow=True)
-        ref = _fb_ref("sensor_readings")
-        # Firebase Admin SDK: ambil semua data lalu filter client-side
-        # (tidak ada query berdasarkan field timestamp string secara native di sini)
-        all_data = ref.get()
-        if not all_data:
-            return
-
-        deleted = 0
-        for key, val in all_data.items():
-            if deleted >= 1000:
-                break
-            if not val:
-                continue
-            ts_str = val.get("timestamp")
-            if not ts_str:
-                continue
-            try:
-                ts_dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                if ts_dt.timestamp() < cutoff:
-                    _fb_ref(f"sensor_readings/{key}").delete()
-                    deleted += 1
-            except Exception:
-                pass
-
-        log.info("Pruned %d old sensor readings", deleted)
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM sensor_readings WHERE timestamp < NOW() - INTERVAL 14 DAY LIMIT 1000"
+                )
+                deleted = cur.rowcount
+                log.info("Pruned %d old sensor readings", deleted)
     except Exception as e:
         log.error("Failed to prune sensor readings: %s", e)
 
@@ -499,7 +438,7 @@ def _maybe_schedule_prune(bg_tasks: BackgroundTasks):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KNN Classify — time-aware confidence adjustment
+# KNN Classify — v6.3.0: time-aware confidence adjustment
 # ══════════════════════════════════════════════════════════════════════════════
 def classify(soil: float, temp: float, rh: float, hour: int = 12) -> dict:
     if knn_model is None or scaler is None:
@@ -607,6 +546,10 @@ def _update_rain_state(score, signals, state, current_min):
 
 
 def _should_skip_sensor(data: SensorData, state: dict, pump_is_on: bool) -> bool:
+    """
+    [v6.3.0] FIX: Tambah parameter pump_is_on.
+    Lompatan soil > 30% tidak lagi dianggap anomali ketika pompa sedang ON.
+    """
     if data.soil_moisture <= 0.0 or data.temperature <= 0.0 or data.temperature >= 60.0:
         log.warning("ANOMALI SENSOR: Soil=%.1f%%, Temp=%.1f°C", data.soil_moisture, data.temperature)
         return True
@@ -678,6 +621,7 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
                 f"Manual override aktif: pompa dikunci off ({remaining}s lagi)"
             )
             resp["decision_path"].append("MANUAL_OVERRIDE_BLOCK")
+            log.debug("Auto-watering diblokir manual_override (sisa %ds)", remaining)
             return resp
         else:
             log.info("Manual override expired, reset otomatis.")
@@ -718,7 +662,7 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
     if night_emergency:
         window_label = "malam-darurat"
 
-    # ── Pompa sedang ON ───────────────────────────────────────────────────────
+    # ── Pompa sedang ON: evaluasi apakah perlu dimatikan ─────────────────────
     if state["pump_status"]:
         elapsed_sec = _elapsed_seconds_real(state.get("pump_start_ts"))
         max_sec     = 60 if night_emergency else (CFG.MAX_PUMP_DURATION_MINUTES * 60)
@@ -759,7 +703,7 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
         resp["decision_path"].append("A4-running")
         return resp
 
-    # ── Darurat ───────────────────────────────────────────────────────────────
+    # ── Darurat: tanah sangat kering ──────────────────────────────────────────
     if night_emergency or (soil_moisture <= CFG.CRITICAL_DRY and not is_raining):
         now_ts = datetime.now().isoformat()
         with _daily_safety_lock:
@@ -802,6 +746,7 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
         resp["decision_path"].append("B6")
         return resp
 
+    # ── Threshold confidence disesuaikan dengan time_weight ───────────────────
     base_threshold = (CFG.CONFIDENCE_HOT if resp["hot_mode"]
                       else (CFG.CONFIDENCE_MISSED if state.get("missed_session")
                             else CFG.CONFIDENCE_NORMAL))
@@ -829,7 +774,7 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
         resp["decision_path"].append("B8")
         return resp
 
-    # ── Nyalakan pompa ────────────────────────────────────────────────────────
+    # ── Semua cek lolos: nyalakan pompa ──────────────────────────────────────
     now_ts = datetime.now().isoformat()
     with _daily_safety_lock:
         _daily_safety["watering_count"] += 1
@@ -852,11 +797,10 @@ def _evaluate_smart_watering(result, hour, minute, soil_moisture, air_humidity,
 def root():
     return {
         "status"      : "online",
-        "message"     : "Siram Pintar API berjalan (Firebase)",
+        "message"     : "Siram Pintar API berjalan",
         "version"     : APP_VERSION,
         "model_ready" : knn_model is not None,
         "auth"        : "required" if VALID_API_KEY else "disabled",
-        "database"    : "Firebase Realtime Database",
     }
 
 
@@ -865,17 +809,14 @@ def root():
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/db-test", dependencies=[Depends(verify_api_key)])
 def db_test():
-    """Test koneksi ke Firebase."""
     try:
-        state = _fb_get(_STATE_PATH)
-        return {
-            "db_status" : "connected",
-            "database"  : "Firebase Realtime Database",
-            "db_url"    : FIREBASE_DB_URL,
-            "has_state" : state is not None,
-        }
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 AS ok")
+                row = cur.fetchone()
+        return {"db_status": "connected", "result": row}
     except Exception as e:
-        log.error("Firebase test failed: %s", e)
+        log.error("DB test failed: %s", e)
         return {"db_status": "error", "detail": str(e)}
 
 
@@ -891,6 +832,7 @@ def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
     hour, minute, _day, time_source = _resolve_time_wit(data.hour, data.minute, data.day)
     result    = classify(data.soil_moisture, data.temperature, data.air_humidity, hour=hour)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    row_id    = str(uuid.uuid4())
 
     state = _get_state(use_cache=True)
     current_total_minutes = _total_minutes(hour, minute)
@@ -938,27 +880,23 @@ def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
     new_state          = _get_state(use_cache=False)
     pump_status_logged = (final_action == "on") if final_action is not None else new_state["pump_status"]
 
-    # Push sensor reading ke Firebase
-    sensor_record = {
-        "id"            : str(uuid.uuid4()),
-        "timestamp"     : timestamp,
-        "soil_moisture" : data.soil_moisture,
-        "temperature"   : data.temperature,
-        "air_humidity"  : data.air_humidity,
-        "label"         : result["label"],
-        "confidence"    : result["confidence"],
-        "needs_watering": result["needs_watering"],
-        "description"   : result["description"],
-        "probabilities" : result["probabilities"],  # dict, Firebase bisa simpan nested
-        "pump_status"   : pump_status_logged,
-        "mode"          : state["mode"],
-    }
-
     def _insert_sensor():
         try:
-            _fb_push("sensor_readings", sensor_record)
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO sensor_readings
+                            (id, timestamp, soil_moisture, temperature, air_humidity,
+                             label, confidence, needs_watering, description,
+                             probabilities, pump_status, mode)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (row_id, timestamp, data.soil_moisture, data.temperature, data.air_humidity,
+                         result["label"], result["confidence"], result["needs_watering"],
+                         result["description"], json.dumps(result["probabilities"]),
+                         pump_status_logged, state["mode"]),
+                    )
         except Exception as e:
-            log.error("Failed to push sensor reading: %s", e)
+            log.error("Failed to insert sensor reading: %s", e)
 
     bg_tasks.add_task(_insert_sensor)
 
@@ -990,22 +928,17 @@ def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
 @app.get("/status", dependencies=[Depends(verify_api_key)])
 def get_status():
     state = _get_state(use_cache=True)
-
-    # Ambil 1 sensor reading terbaru dari Firebase
-    latest = None
     try:
-        all_readings = _fb_get("sensor_readings")
-        if all_readings:
-            # Urutkan berdasarkan timestamp, ambil yang terbaru
-            sorted_items = sorted(
-                all_readings.items(),
-                key=lambda x: x[1].get("timestamp", "") if x[1] else "",
-                reverse=True
-            )
-            if sorted_items:
-                latest = sorted_items[0][1]
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM sensor_readings ORDER BY timestamp DESC LIMIT 1")
+                latest = cur.fetchone()
     except Exception as e:
         log.error("Failed to get latest sensor: %s", e)
+        latest = None
+
+    if latest and isinstance(latest.get("probabilities"), str):
+        latest["probabilities"] = json.loads(latest["probabilities"])
 
     return {
         "pump_status"     : state["pump_status"],
@@ -1044,24 +977,23 @@ def get_pump_status():
 @app.get("/history", dependencies=[Depends(verify_api_key)])
 def get_history(limit: int = Query(default=50, ge=1, le=500)):
     try:
-        all_readings = _fb_get("sensor_readings")
-        if not all_readings:
-            return {"total": 0, "records": []}
-
-        # Urutkan ascending berdasarkan timestamp
-        sorted_items = sorted(
-            all_readings.items(),
-            key=lambda x: x[1].get("timestamp", "") if x[1] else "",
-            reverse=False
-        )
-        # Ambil `limit` item terbaru (dari belakang)
-        recent = sorted_items[-limit:]
-        records = [item[1] for item in recent if item[1]]
-
-        return {"total": len(records), "records": records}
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM sensor_readings ORDER BY timestamp DESC LIMIT %s", (limit,)
+                )
+                rows = cur.fetchall()
     except Exception as e:
         log.error("Failed to get history: %s", e)
         return {"total": 0, "records": []}
+
+    records = []
+    for r in reversed(rows):
+        if isinstance(r.get("probabilities"), str):
+            r["probabilities"] = json.loads(r["probabilities"])
+        records.append(r)
+
+    return {"total": len(records), "records": records}
 
 
 @app.post("/control", dependencies=[Depends(verify_api_key)])
@@ -1111,10 +1043,11 @@ def control_pump(cmd: ControlCommand):
                 h_wit   = (now_utc.hour + 9) % 24
                 update_kwargs["pump_start_minute"]  = _total_minutes(h_wit, now_utc.minute)
 
+        # ✅ _update_state sekarang pakai backtick — `mode` tersimpan dengan benar
         _update_state(**update_kwargs)
         new_state = _get_state(use_cache=False)
 
-        log.info("Control: action=%s mode=%s → Firebase mode=%s pump=%s",
+        log.info("Control: action=%s mode=%s → DB mode=%s pump=%s",
                  action, mode, new_state["mode"], new_state["pump_status"])
 
         return {
@@ -1145,7 +1078,6 @@ def predict(data: SensorData):
 def get_config():
     return {
         "version": APP_VERSION,
-        "database": "Firebase Realtime Database",
         "watering_windows": {
             "morning": f"{CFG.MORNING_WINDOW[0]:02d}:00–{CFG.MORNING_WINDOW[1]:02d}:59",
             "evening": f"{CFG.EVENING_WINDOW[0]:02d}:00–{CFG.EVENING_WINDOW[1]:02d}:59",
@@ -1203,6 +1135,7 @@ def reset_override():
 def get_diagnostics():
     """
     Tampilkan semua state internal, info daily safety, dan info model KNN.
+    Berguna untuk debugging tanpa harus masuk ke database.
     """
     state = _get_state(use_cache=False)
 
@@ -1228,8 +1161,6 @@ def get_diagnostics():
 
     return {
         "version"               : APP_VERSION,
-        "database"              : "Firebase Realtime Database",
-        "firebase_url"          : FIREBASE_DB_URL,
         "server_time_wit"       : datetime.utcnow().strftime("%H:%M:%S") + " (UTC, +9=WIT)",
         "state"                 : {k: str(v) if v is not None else None for k, v in state.items()},
         "daily_safety"          : safety_snapshot,
